@@ -9,10 +9,10 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
                     level=logging.INFO)
 
 # Get the logger instance
-logger = logging.getLogger(name)
+logger = logging.getLogger(__name__)
 
 # Create an Updater instance with your bot token
-updater = Updater(token='6399081736:AAEietH_LsAD-ecun5z_7tpdlNZHtvC0z_Y', use_context=True)
+updater = Updater(token='YOUR_BOT_TOKEN', use_context=True)
 
 # Define a command handler for your bot
 def display_ad(update, context):
