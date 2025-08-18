@@ -1,0 +1,3406 @@
+INDEPENDENT AUTHENTICATION SET - GitLab (Community Edition)
+
+===== FILE: /gitlab/lib/gitlab/auth.rb =====
+# frozen_string_literal: true
+
+module Gitlab
+  module Auth
+    MissingPersonalAccessTokenError = Class.new(StandardError)
+
+    # Scopes used for GitLab internal API (Kubernetes cluster access)
+    K8S_PROXY_SCOPE = :k8s_proxy
+
+    # Scopes used for token allowed to rotate themselves
+    SELF_ROTATE_SCOPE = :self_rotate
+
+    # Scopes used for GitLab API access
+    API_SCOPE = :api
+    READ_API_SCOPE = :read_api
+    READ_USER_SCOPE = :read_user
+    CREATE_RUNNER_SCOPE = :create_runner
+    MANAGE_RUNNER_SCOPE = :manage_runner
+    MCP_SCOPE = :mcp
+    API_SCOPES = [
+      API_SCOPE, READ_API_SCOPE,
+      READ_USER_SCOPE,
+      CREATE_RUNNER_SCOPE, MANAGE_RUNNER_SCOPE,
+      K8S_PROXY_SCOPE,
+      SELF_ROTATE_SCOPE,
+      MCP_SCOPE
+    ].freeze
+
+    # Scopes for Duo
+    AI_FEATURES = :ai_features
+    AI_FEATURES_SCOPES = [AI_FEATURES].freeze
+    AI_WORKFLOW = :ai_workflows
+    AI_WORKFLOW_SCOPES = [AI_WORKFLOW].freeze
+    DYNAMIC_USER = :"user:*"
+    DYNAMIC_SCOPES = [DYNAMIC_USER].freeze
+
+    PROFILE_SCOPE = :profile
+    EMAIL_SCOPE = :email
+    OPENID_SCOPE = :openid
+    # Scopes used for OpenID Connect
+    OPENID_SCOPES = [OPENID_SCOPE].freeze
+    # OpenID Connect profile scopes
+    PROFILE_SCOPES = [PROFILE_SCOPE, EMAIL_SCOPE].freeze
+
+    # Scopes used for GitLab Repository access
+    READ_REPOSITORY_SCOPE = :read_repository
+    WRITE_REPOSITORY_SCOPE = :write_repository
+    REPOSITORY_SCOPES = [READ_REPOSITORY_SCOPE, WRITE_REPOSITORY_SCOPE].freeze
+
+    # Scopes used for GitLab Docker Registry access
+    READ_REGISTRY_SCOPE = :read_registry
+    WRITE_REGISTRY_SCOPE = :write_registry
+    REGISTRY_SCOPES = [READ_REGISTRY_SCOPE, WRITE_REGISTRY_SCOPE].freeze
+
+    # Scopes used for Virtual Registry access
+    READ_VIRTUAL_REGISTRY_SCOPE = :read_virtual_registry
+    WRITE_VIRTUAL_REGISTRY_SCOPE = :write_virtual_registry
+    VIRTUAL_REGISTRY_SCOPES = [
+      READ_VIRTUAL_REGISTRY_SCOPE, WRITE_VIRTUAL_REGISTRY_SCOPE
+    ].freeze
+
+    # Scopes used for GitLab Observability access which is outside of the GitLab app itself.
+    # Hence the lack of ability mapping in `abilities_for_scopes`.
+    READ_OBSERVABILITY_SCOPE = :read_observability
+    WRITE_OBSERVABILITY_SCOPE = :write_observability
+    OBSERVABILITY_SCOPES = [READ_OBSERVABILITY_SCOPE, WRITE_OBSERVABILITY_SCOPE].freeze
+
+    # Scopes for Monitor access
+    READ_SERVICE_PING_SCOPE = :read_service_ping
+
+    # Scopes used for GitLab as admin
+    SUDO_SCOPE = :sudo
+    ADMIN_MODE_SCOPE = :admin_mode
+    ADMIN_SCOPES = [SUDO_SCOPE, ADMIN_MODE_SCOPE, READ_SERVICE_PING_SCOPE].freeze
+
+    Q_SCOPES = [API_SCOPE, REPOSITORY_SCOPES].flatten.freeze
+
+    # Default scopes for OAuth applications that don't define their own
+    DEFAULT_SCOPES = [API_SCOPE].freeze
+
+    # Scopes ordered by permission level, from lowest to highest.
+    # This is used to determine the order of scopes in the UI.
+    # If the scope is not present in this list, it won't appear in the UI.
+    UI_SCOPES_ORDERED_BY_PERMISSION = [
+      READ_SERVICE_PING_SCOPE,
+      READ_USER_SCOPE,
+      READ_REPOSITORY_SCOPE,
+      READ_OBSERVABILITY_SCOPE,
+      READ_VIRTUAL_REGISTRY_SCOPE,
+      READ_REGISTRY_SCOPE,
+      READ_API_SCOPE,
+      SELF_ROTATE_SCOPE,
+      WRITE_REPOSITORY_SCOPE,
+      WRITE_OBSERVABILITY_SCOPE,
+      WRITE_VIRTUAL_REGISTRY_SCOPE,
+      WRITE_REGISTRY_SCOPE,
+      API_SCOPE,
+      AI_FEATURES,
+      CREATE_RUNNER_SCOPE,
+      MANAGE_RUNNER_SCOPE,
+      K8S_PROXY_SCOPE,
+      ADMIN_MODE_SCOPE,
+      SUDO_SCOPE
+    ].freeze
+
+    CI_JOB_USER = 'gitlab-ci-token'
+
+    extend Gitlab::InternalEventsTracking
+
+    class << self
+      prepend_mod_with('Gitlab::Auth') # rubocop: disable Cop/InjectEnterpriseEditionModule
+
+      def omniauth_enabled?
+        Gitlab.config.omniauth.enabled
+      end
+
+      def find_for_git_client(login, password, project:, request:)
+        raise "Must provide an IP for rate limiting" if request.ip.nil?
+
+        rate_limiter = Gitlab::Auth::IpRateLimiter.new(request.ip)
+
+        raise IpBlocked if !skip_rate_limit?(login: login) && rate_limiter.banned?
+
+        # `user_with_password_for_git` should be the last check
+        # because it's the most expensive, especially when LDAP
+        # is enabled.
+        result =
+          service_request_check(login, password, project) ||
+          build_access_token_check(login, password) ||
+          lfs_token_check(login, password, project, request) ||
+          oauth_access_token_check(password) ||
+          personal_access_token_check(password, project) ||
+          deploy_token_check(login, password, project) ||
+          user_with_password_for_git(login, password) ||
+          Gitlab::Auth::Result::EMPTY
+
+        rate_limit!(rate_limiter, success: result.success?, login: login, request: request)
+        look_to_limit_user(result.actor)
+
+        return result if result.success? || authenticate_using_internal_or_ldap_password?
+
+        # If sign-in is disabled and LDAP is not configured, recommend a
+        # personal access token on failed auth attempts
+        raise Gitlab::Auth::MissingPersonalAccessTokenError
+      end
+
+      # Find and return a user if the provided password is valid for various
+      # authenticators (OAuth, LDAP, Local Database).
+      #
+      # Specify `increment_failed_attempts: true` to increment Devise `failed_attempts`.
+      # CAUTION: Avoid incrementing failed attempts when authentication falls through
+      # different mechanisms, as in `.find_for_git_client`. This may lead to
+      # unwanted access locks when the value provided for `password` was actually
+      # a PAT, deploy token, etc.
+      def find_with_user_password(login, password, increment_failed_attempts: false)
+        # Avoid resource intensive checks if login credentials are not provided
+        return unless login.present? && password.present?
+
+        # Nothing to do here if internal auth is disabled and LDAP is
+        # not configured
+        return unless authenticate_using_internal_or_ldap_password?
+
+        Gitlab::Auth::UniqueIpsLimiter.limit_user! do
+          user = User.find_by_login(login)
+
+          break if user && !user.can_log_in_with_non_expired_password?
+
+          authenticators = []
+
+          if user
+            authenticators << Gitlab::Auth::OAuth::Provider.authentication(user, 'database')
+
+            # Add authenticators for all identities if user is not nil
+            user&.identities&.each do |identity|
+              authenticators << Gitlab::Auth::OAuth::Provider.authentication(user, identity.provider)
+            end
+          else
+            # If no user is provided, try LDAP.
+            #   LDAP users are only authenticated via LDAP
+            authenticators << Gitlab::Auth::Ldap::Authentication
+          end
+
+          authenticators.compact!
+
+          # return found user that was authenticated first for given login credentials
+          authenticated_user = authenticators.find do |auth|
+            authenticated_user = auth.login(login, password)
+            break authenticated_user if authenticated_user
+          end
+
+          user_auth_attempt!(user, success: !!authenticated_user) if increment_failed_attempts
+
+          authenticated_user
+        end
+      end
+
+      private
+
+      def rate_limit!(rate_limiter, success:, login:, request:)
+        return if skip_rate_limit?(login: login)
+
+        if success
+          # Repeated login 'failures' are normal behavior for some Git clients so
+          # it is important to reset the ban counter once the client has proven
+          # they are not a 'bad guy'.
+          rate_limiter.reset!
+        elsif rate_limiter.register_fail!
+          # Register a login failure so that Rack::Attack can block the next
+          # request from this IP if needed.
+          # This returns true when the failures are over the threshold and the IP
+          # is banned.
+
+          message = "Rack_Attack: Git auth failures has exceeded the threshold. " \
+            "IP has been temporarily banned from Git auth."
+
+          Gitlab::AuthLogger.error(
+            message: message,
+            env: :blocklist,
+            remote_ip: request.ip,
+            request_method: request.request_method,
+            path: request.filtered_path,
+            login: login
+          )
+        end
+      end
+
+      def skip_rate_limit?(login:)
+        CI_JOB_USER == login
+      end
+
+      def look_to_limit_user(actor)
+        Gitlab::Auth::UniqueIpsLimiter.limit_user!(actor) if actor.is_a?(User)
+      end
+
+      def authenticate_using_internal_or_ldap_password?
+        Gitlab::CurrentSettings.password_authentication_enabled_for_git? || Gitlab::Auth::Ldap::Config.enabled?
+      end
+
+      def service_request_check(login, password, project)
+        matched_login = /(?<service>^[a-zA-Z]*-ci)-token$/.match(login)
+
+        return unless project && matched_login.present?
+
+        underscored_service = matched_login['service'].underscore
+
+        return unless Integration.available_integration_names.include?(underscored_service)
+
+        # We treat underscored_service as a trusted input because it is included
+        # in the Integration.available_integration_names allowlist.
+        accessor = Project.integration_association_name(underscored_service)
+        service = project.public_send(accessor) # rubocop:disable GitlabSecurity/PublicSend
+
+        return unless service && service.activated? && service.valid_token?(password)
+
+        Gitlab::Auth::Result.new(nil, project, :ci, build_authentication_abilities)
+      end
+
+      def user_with_password_for_git(login, password)
+        # Prevent LDAP and database authentication attempts when password is a token
+        return if password.present? && Authn::AgnosticTokenIdentifier.token?(password)
+
+        user = find_with_user_password(login, password)
+        return unless user
+
+        if user.ldap_user? &&
+            Gitlab::CurrentSettings.password_authentication_enabled_for_git? &&
+            Gitlab::Auth::Ldap::Config.prevent_ldap_sign_in?
+          track_internal_event(
+            'authenticate_to_ldap_with_git_over_https_when_prevent_ldap_sign_in_is_enabled',
+            user: user,
+            category: name
+          )
+        end
+
+        verifier = TwoFactorAuthVerifier.new(user)
+
+        if user.two_factor_enabled? || verifier.two_factor_authentication_enforced?
+          raise Gitlab::Auth::MissingPersonalAccessTokenError
+        end
+
+        Gitlab::Auth::Result.new(user, nil, :gitlab_or_ldap, full_authentication_abilities)
+      end
+
+      def oauth_access_token_check(password)
+        if password.present?
+          token = OauthAccessToken.by_token(password)
+
+          if valid_oauth_token?(token)
+            identity = ::Gitlab::Auth::Identity.link_from_oauth_token(token)
+            return if identity && !identity.valid?
+
+            resource_owner_id = identity&.composite? ? identity.scoped_user.id : token.resource_owner_id
+            user = User.id_in(resource_owner_id).first
+            return unless user && user.can_log_in_with_non_expired_password?
+
+            Gitlab::Auth::Result.new(user, nil, :oauth, abilities_for_scopes(token.scopes))
+          end
+        end
+      end
+
+      def personal_access_token_check(password, project)
+        return unless password.present?
+
+        finder_options = { state: 'active' }
+        finder_options[:impersonation] = false unless Gitlab.config.gitlab.impersonation_enabled
+
+        token = PersonalAccessTokensFinder.new(finder_options).find_by_token(password)
+
+        return unless token
+
+        return unless valid_scoped_token?(token, all_available_scopes)
+
+        if project && (token.user.project_bot? || token.user.service_account?)
+          return unless can_read_project?(token.user, project)
+        end
+
+        if token.user.can_log_in_with_non_expired_password? || (token.user.project_bot? || token.user.service_account?)
+          ::PersonalAccessTokens::LastUsedService.new(token).execute
+
+          Gitlab::Auth::Result.new(token.user, nil, :personal_access_token, abilities_for_scopes(token.scopes))
+        end
+      end
+
+      def can_read_project?(user, project)
+        user.can?(:read_project, project)
+      end
+
+      def bot_user_can_read_project?(user, project)
+        (user.project_bot? || user.service_account? || user.security_policy_bot?) && can_read_project?(user, project)
+      end
+
+      def valid_oauth_token?(token)
+        token && token.accessible? && valid_scoped_token?(token, Doorkeeper.configuration.scopes)
+      end
+
+      def valid_scoped_token?(token, scopes)
+        AccessTokenValidationService.new(token).include_any_scope?(scopes)
+      end
+
+      def abilities_for_scopes(scopes)
+        abilities_by_scope = {
+          api: full_authentication_abilities,
+          read_api: read_only_authentication_abilities,
+          read_registry: %i[read_container_image],
+          write_registry: %i[create_container_image],
+          read_virtual_registry: %i[read_dependency_proxy],
+          write_virtual_registry: %i[write_dependency_proxy],
+          read_repository: %i[download_code],
+          write_repository: %i[download_code push_code],
+          create_runner: %i[create_instance_runners create_runners],
+          manage_runner: %i[assign_runner update_runner delete_runner],
+          ai_workflows: %i[push_code download_code],
+          mcp: %i[execute_mcp_tool] # This ability doesn't exist yet
+        }
+
+        scopes.flat_map do |scope|
+          abilities_by_scope.fetch(scope.to_sym, [])
+        end.uniq
+      end
+
+      def deploy_token_check(login, password, project)
+        return unless password.present?
+
+        token = DeployToken.active.find_by_token(password)
+
+        return unless token && login
+        return if login != token.username
+
+        # Registry access (with jwt) does not have access to project
+        return if project && !token.has_access_to?(project)
+        # When repository is disabled, no resources are accessible via Deploy Token
+        return if project&.repository_access_level == ::ProjectFeature::DISABLED
+
+        scopes = abilities_for_scopes(token.scopes)
+
+        if valid_scoped_token?(token, all_available_scopes)
+          Gitlab::Auth::Result.new(token, project, :deploy_token, scopes)
+        end
+      end
+
+      def lfs_token_check(login, encoded_token, project, request)
+        return unless login
+        return unless git_lfs_request?(request)
+
+        deploy_key_matches = login.match(/\Alfs\+deploy-key-(\d+)\z/)
+
+        actor =
+          if deploy_key_matches
+            DeployKey.find(deploy_key_matches[1])
+          else
+            User.find_by_login(login)
+          end
+
+        return unless actor
+
+        token_handler = Gitlab::LfsToken.new(actor, project)
+
+        authentication_abilities =
+          if token_handler.user?
+            read_write_project_authentication_abilities
+          elsif token_handler.deploy_key_pushable?(project)
+            read_write_authentication_abilities
+          else
+            read_only_authentication_abilities
+          end
+
+        if token_handler.token_valid?(encoded_token)
+          Gitlab::Auth::Result.new(actor, nil, token_handler.type, authentication_abilities)
+        end
+      end
+
+      def build_access_token_check(login, password)
+        return unless login == CI_JOB_USER
+        return unless password
+
+        build = find_build_by_token(password)
+        return unless build
+        return unless build.project.builds_enabled?
+
+        if build.user
+          return unless build.user.can_log_in_with_non_expired_password? || bot_user_can_read_project?(build.user, build.project)
+
+          auth_context = { authentication_method: :ci_job_token, authentication_method_id: build.id }
+          # If user is assigned to build, use restricted credentials of user
+          Gitlab::Auth::Result.new(build.user, build.project, :build, build_authentication_abilities, auth_context)
+        else
+          # Otherwise use generic CI credentials (backward compatibility)
+          Gitlab::Auth::Result.new(nil, build.project, :ci, build_authentication_abilities)
+        end
+      end
+
+      public
+
+      def build_authentication_abilities
+        [
+          :read_project,
+          :build_download_code,
+          :build_push_code,
+          :build_read_container_image,
+          :build_create_container_image,
+          :build_destroy_container_image
+        ]
+      end
+
+      def read_only_project_authentication_abilities
+        [
+          :read_project,
+          :download_code
+        ]
+      end
+
+      def read_write_project_authentication_abilities
+        read_only_project_authentication_abilities + [
+          :push_code
+        ]
+      end
+
+      def read_only_authentication_abilities
+        read_only_project_authentication_abilities + [
+          :read_container_image
+        ]
+      end
+
+      def read_write_authentication_abilities
+        read_only_authentication_abilities + [
+          :push_code,
+          :create_container_image
+        ]
+      end
+
+      def full_authentication_abilities
+        read_write_authentication_abilities + [
+          :admin_container_image
+        ]
+      end
+
+      def available_scopes_for(resource)
+        available_scopes_for_resource(resource) - unavailable_scopes_for_resource(resource)
+      end
+
+      def all_available_scopes
+        non_admin_available_scopes + ADMIN_SCOPES
+      end
+
+      # Other available scopes
+      def optional_scopes
+        all_available_scopes + OPENID_SCOPES + PROFILE_SCOPES + AI_WORKFLOW_SCOPES + DYNAMIC_SCOPES - DEFAULT_SCOPES
+      end
+
+      def registry_scopes
+        return [] unless Gitlab.config.registry.enabled
+
+        REGISTRY_SCOPES
+      end
+
+      def virtual_registry_scopes
+        return [] unless Gitlab.config.dependency_proxy.enabled
+
+        VIRTUAL_REGISTRY_SCOPES
+      end
+
+      def resource_bot_scopes
+        non_admin_available_scopes - [READ_USER_SCOPE]
+      end
+
+      private
+
+      def git_lfs_request?(request)
+        Gitlab::PathRegex.repository_git_lfs_route_regex.match?(request.path)
+      end
+
+      def available_scopes_for_resource(resource)
+        case resource
+        when User
+          scopes = non_admin_available_scopes
+
+          if resource.admin? # rubocop: disable Cop/UserAdmin
+            scopes += ADMIN_SCOPES
+          end
+
+          scopes
+        when Project, Group
+          resource_bot_scopes
+        else
+          []
+        end
+      end
+
+      def unavailable_scopes_for_resource(resource)
+        unavailable_ai_features_scopes +
+          unavailable_observability_scopes_for_resource(resource) +
+          unavailable_virtual_registry_scopes_for_resource(resource)
+      end
+
+      def unavailable_ai_features_scopes
+        AI_WORKFLOW_SCOPES
+      end
+
+      def unavailable_observability_scopes_for_resource(resource)
+        return [] if (resource.is_a?(Project) || resource.is_a?(Group)) &&
+          Gitlab::Observability.should_enable_observability_auth_scopes?(resource)
+
+        OBSERVABILITY_SCOPES
+      end
+
+      def unavailable_virtual_registry_scopes_for_resource(resource)
+        return VIRTUAL_REGISTRY_SCOPES if resource.is_a?(Project)
+
+        []
+      end
+
+      def non_admin_available_scopes
+        API_SCOPES + REPOSITORY_SCOPES + registry_scopes + virtual_registry_scopes + OBSERVABILITY_SCOPES + AI_FEATURES_SCOPES
+      end
+
+      def find_build_by_token(token)
+        ::Gitlab::Database::LoadBalancing::SessionMap
+          .with_sessions([::ApplicationRecord, ::Ci::ApplicationRecord]).use_primary do
+          ::Ci::AuthJobFinder.new(token: token).execute
+        end
+      end
+
+      def user_auth_attempt!(user, success:)
+        return unless user && Gitlab::Database.read_write?
+        return user.unlock_access! if success
+
+        user.increment_failed_attempts!
+      end
+    end
+  end
+end
+
+Gitlab::Auth.prepend_mod_with('Gitlab::Auth')
+
+
+===== FILE: /gitlab/lib/gitlab/auth/request_authenticator.rb =====
+# frozen_string_literal: true
+
+# Use for authentication only, in particular for Rack::Attack.
+# Does not perform authorization of scopes, etc.
+module Gitlab
+  module Auth
+    class RequestAuthenticator
+      include AuthFinders
+
+      attr_reader :request
+
+      def initialize(request)
+        @request = request
+      end
+
+      def find_authenticated_requester(request_formats)
+        deploy_token_from_request || user(request_formats)
+      end
+
+      def user(request_formats)
+        request_formats.each do |format|
+          user = find_sessionless_user(format)
+
+          return user if user
+        end
+
+        find_user_from_warden
+      end
+
+      def runner
+        find_runner_from_token
+      rescue Gitlab::Auth::AuthenticationError
+        nil
+      end
+
+      def find_sessionless_user(request_format)
+        case request_format
+        when :graphql_api
+          find_user_for_graphql_api_request
+        when :api, :git, :rss, :ics, :blob, :download, :archive, nil
+          find_user_from_any_authentication_method(request_format)
+        else
+          raise ArgumentError, "Unknown request format"
+        end
+      rescue Gitlab::Auth::AuthenticationError
+        nil
+      end
+
+      def can_sign_in_bot?(user)
+        # Allow bots and service accounts to access both API and archive endpoints
+        (user&.project_bot? || user&.service_account?) && (api_request? || archive_request?)
+      end
+
+      def valid_access_token?(scopes: [])
+        # We may just be checking whether the user has :admin_mode access, so
+        # don't construe an auth failure as a real failure.
+        validate_and_save_access_token!(scopes: scopes, save_auth_context: false)
+
+        true
+      rescue Gitlab::Auth::AuthenticationError
+        false
+      end
+
+      private
+
+      # Use a minimal subset of find_user_from_any_authentication_method
+      # so only token types allowed for GraphQL can authenticate users.
+      # CI_JOB_TOKENs are not allowed for now, since their access is too broad.
+      #
+      # Overridden in EE
+      def find_user_for_graphql_api_request
+        find_user_from_web_access_token(:api, scopes: graphql_authorization_scopes) ||
+          find_user_from_personal_access_token_for_api_or_git
+      end
+
+      # Overridden in EE
+      def graphql_authorization_scopes
+        [:api, :read_api]
+      end
+
+      def find_user_from_any_authentication_method(request_format)
+        find_user_from_dependency_proxy_token ||
+          find_user_from_web_access_token(request_format, scopes: [:api, :read_api]) ||
+          find_user_from_feed_token(request_format) ||
+          find_user_from_static_object_token(request_format) ||
+          find_user_from_job_token ||
+          find_user_from_personal_access_token_for_api_or_git ||
+          find_user_for_git_or_lfs_request
+      end
+
+      def access_token
+        strong_memoize(:access_token) do
+          super || find_personal_access_token_from_http_basic_auth
+        end
+      end
+
+      def route_authentication_setting
+        @route_authentication_setting ||= {
+          job_token_allowed: api_request?,
+          basic_auth_personal_access_token: api_request? || git_request?,
+          deploy_token_allowed: api_request? || git_request?
+        }
+      end
+    end
+  end
+end
+
+Gitlab::Auth::RequestAuthenticator.prepend_mod
+
+
+===== FILE: /gitlab/lib/gitlab/api_authentication/token_locator.rb =====
+# frozen_string_literal: true
+
+module Gitlab
+  module APIAuthentication
+    class TokenLocator
+      UsernameAndPassword = Struct.new(:username, :password)
+
+      include ActiveModel::Validations
+      include ActionController::HttpAuthentication::Basic
+
+      VALID_LOCATIONS = %i[
+        http_basic_auth
+        http_token
+        http_bearer_token
+        http_deploy_token_header
+        http_job_token_header
+        http_private_token_header
+        http_header
+        token_param
+        private_token_param
+        job_token_param
+        access_token_param
+      ].freeze
+
+      attr_reader :location
+
+      validates :location, inclusion: { in: VALID_LOCATIONS }
+
+      def initialize(location)
+        @location = extract_location(location)
+        validate!
+      end
+
+      def extract(request)
+        case @location
+        when :http_basic_auth
+          extract_from_http_basic_auth(request)
+        when :http_token
+          extract_from_http_token(request)
+        when :http_bearer_token
+          extract_from_http_bearer_token(request)
+        when :http_deploy_token_header
+          extract_from_http_deploy_token_header(request)
+        when :http_job_token_header
+          extract_from_http_job_token_header(request)
+        when :http_private_token_header
+          extract_from_http_private_token_header(request)
+        when :http_header
+          extract_from_http_header(request)
+        when :token_param
+          extract_from_query_param(request, 'token')
+        when :private_token_param
+          extract_from_query_param(request, 'private_token')
+        when :job_token_param
+          extract_from_query_param(request, 'job_token')
+        when :access_token_param
+          extract_from_query_param(request, 'access_token')
+        end
+      end
+
+      private
+
+      def extract_location(location)
+        case location
+        when Symbol
+          location
+        when Hash
+          result, @token_identifier = location.detect { |k, _v| VALID_LOCATIONS.include?(k) }
+          result
+        end
+      end
+
+      def extract_from_http_basic_auth(request)
+        username, password = user_name_and_password(request)
+        return unless username.present? && password.present?
+
+        UsernameAndPassword.new(username, password)
+      end
+
+      def extract_from_http_token(request)
+        password = request.headers['Authorization']
+        return unless password.present?
+
+        UsernameAndPassword.new(nil, password)
+      end
+
+      def extract_from_http_bearer_token(request)
+        password = request.headers['Authorization']
+        return unless password.present?
+
+        UsernameAndPassword.new(nil, password.split(' ').last)
+      end
+
+      def extract_from_http_deploy_token_header(request)
+        password = request.headers['Deploy-Token']
+        return unless password.present?
+
+        UsernameAndPassword.new(nil, password)
+      end
+
+      def extract_from_http_job_token_header(request)
+        password = request.headers['Job-Token']
+        return unless password.present?
+
+        UsernameAndPassword.new(nil, password)
+      end
+
+      def extract_from_http_private_token_header(request)
+        password = request.headers['Private-Token']
+        return unless password.present?
+
+        UsernameAndPassword.new(nil, password)
+      end
+
+      def extract_from_http_header(request)
+        password = request.headers[@token_identifier]
+        return unless password.present?
+
+        UsernameAndPassword.new(nil, password)
+      end
+
+      def extract_from_query_param(request, param_name)
+        password = request.query_parameters[param_name]
+        return unless password.present?
+
+        UsernameAndPassword.new(nil, password)
+      end
+    end
+  end
+end
+
+
+===== FILE: /gitlab/lib/gitlab/api_authentication/token_resolver.rb =====
+# frozen_string_literal: true
+
+module Gitlab
+  module APIAuthentication
+    class TokenResolver
+      include ActiveModel::Validations
+
+      attr_reader :token_type
+
+      validates :token_type, inclusion: {
+        in: %i[
+          personal_access_token_with_username
+          job_token_with_username
+          deploy_token_with_username
+          personal_access_token
+          job_token
+          deploy_token
+          personal_access_token_from_jwt
+          deploy_token_from_jwt
+          job_token_from_jwt
+          oauth_token
+        ]
+      }
+
+      UsernameAndPassword = ::Gitlab::APIAuthentication::TokenLocator::UsernameAndPassword
+
+      def initialize(token_type)
+        @token_type = token_type
+        validate!
+      end
+
+      # Existing behavior is known to be inconsistent across authentication
+      # methods with regards to whether to silently ignore present but invalid
+      # credentials or to raise an error/respond with 401.
+      #
+      # If a token can be located from the provided credentials, but the token
+      # or credentials are in some way invalid, this implementation opts to
+      # raise an error.
+      #
+      # For example, if the raw credentials include a username and password, and
+      # a token is resolved from the password, but the username does not match
+      # the token, an error will be raised.
+      #
+      # See https://gitlab.com/gitlab-org/gitlab/-/issues/246569
+
+      def resolve(raw)
+        case @token_type
+        when :personal_access_token
+          resolve_personal_access_token(raw)
+        when :job_token
+          resolve_job_token(raw)
+        when :deploy_token
+          resolve_deploy_token(raw)
+        when :personal_access_token_with_username
+          resolve_personal_access_token_with_username(raw)
+        when :job_token_with_username
+          resolve_job_token_with_username(raw)
+        when :deploy_token_with_username
+          resolve_deploy_token_with_username(raw)
+        when :personal_access_token_from_jwt
+          resolve_personal_access_token_from_jwt(raw)
+        when :deploy_token_from_jwt
+          resolve_deploy_token_from_jwt(raw)
+        when :job_token_from_jwt
+          resolve_job_token_from_jwt(raw)
+        when :oauth_token
+          resolve_oauth_token(raw)
+        end
+      end
+
+      private
+
+      def resolve_personal_access_token_with_username(raw)
+        raise ::Gitlab::Auth::UnauthorizedError unless raw.username
+
+        with_personal_access_token(raw) do |pat|
+          break unless pat
+
+          # Ensure that the username matches the token. This check is a subtle
+          # departure from the existing behavior of #find_personal_access_token_from_http_basic_auth.
+          # https://gitlab.com/gitlab-org/gitlab/-/merge_requests/38627#note_435907856
+          raise ::Gitlab::Auth::UnauthorizedError unless pat.user.username == raw.username
+
+          pat
+        end
+      end
+
+      def resolve_job_token_with_username(raw)
+        # Only look for a job if the username is correct
+        return if ::Gitlab::Auth::CI_JOB_USER != raw.username
+
+        with_job_token(raw) do |job|
+          job
+        end
+      end
+
+      def resolve_deploy_token_with_username(raw)
+        with_deploy_token(raw) do |token|
+          break unless token
+
+          # Ensure that the username matches the token. This check is a subtle
+          # departure from the existing behavior of #deploy_token_from_request.
+          # https://gitlab.com/gitlab-org/gitlab/-/merge_requests/38627#note_474826205
+          raise ::Gitlab::Auth::UnauthorizedError unless token.username == raw.username
+
+          token
+        end
+      end
+
+      def resolve_personal_access_token(raw)
+        with_personal_access_token(raw) do |pat|
+          pat
+        end
+      end
+
+      def resolve_job_token(raw)
+        with_job_token(raw) do |job|
+          job
+        end
+      end
+
+      def resolve_deploy_token(raw)
+        with_deploy_token(raw) do |token|
+          token
+        end
+      end
+
+      def resolve_personal_access_token_from_jwt(raw)
+        with_jwt_token(raw) do |jwt_token|
+          break unless jwt_token['token'].is_a?(Integer)
+
+          pat = ::PersonalAccessToken.find(jwt_token['token'])
+          break unless pat
+
+          pat
+        end
+      end
+
+      def resolve_deploy_token_from_jwt(raw)
+        with_jwt_token(raw) do |jwt_token|
+          break unless jwt_token['token'].is_a?(String)
+
+          resolve_deploy_token(UsernameAndPassword.new(nil, jwt_token['token']))
+        end
+      end
+
+      def resolve_job_token_from_jwt(raw)
+        with_jwt_token(raw) do |jwt_token|
+          break unless jwt_token['token'].is_a?(String)
+
+          resolve_job_token(UsernameAndPassword.new(nil, jwt_token['token']))
+        end
+      end
+
+      def resolve_oauth_token(raw)
+        oauth_token = OauthAccessToken.by_token(raw.password)
+        raise ::Gitlab::Auth::UnauthorizedError unless oauth_token
+
+        oauth_token.revoke_previous_refresh_token!
+
+        ::Gitlab::Auth::Identity.link_from_oauth_token(oauth_token).tap do |identity|
+          raise ::Gitlab::Auth::UnauthorizedError if identity && !identity.valid?
+        end
+
+        oauth_token
+      end
+
+      def with_personal_access_token(raw, &block)
+        pat = ::PersonalAccessToken.find_by_token(raw.password)
+        return unless pat
+
+        yield(pat)
+      end
+
+      def with_deploy_token(raw, &block)
+        unless Gitlab::ExternalAuthorization.allow_deploy_tokens_and_deploy_keys?
+          raise ::Gitlab::Auth::UnauthorizedError
+        end
+
+        token = ::DeployToken.active.find_by_token(raw.password)
+        return unless token
+
+        yield(token)
+      end
+
+      def with_job_token(raw, &block)
+        job = ::Ci::AuthJobFinder.new(token: raw.password).execute
+        raise ::Gitlab::Auth::UnauthorizedError unless job
+
+        yield(job)
+      end
+
+      def with_jwt_token(raw, &block)
+        jwt_token = ::Gitlab::JWTToken.decode(raw.password)
+        raise ::Gitlab::Auth::UnauthorizedError unless jwt_token
+
+        yield(jwt_token)
+      end
+    end
+  end
+end
+
+
+===== FILE: /gitlab/lib/api/helpers/authentication.rb =====
+# frozen_string_literal: true
+
+module API
+  module Helpers
+    module Authentication
+      extend ActiveSupport::Concern
+
+      class_methods do
+        def authenticate_with(&block)
+          strategies = ::Gitlab::APIAuthentication::Builder.new.build(&block)
+          namespace_inheritable :authentication, strategies
+        end
+      end
+
+      included do
+        helpers ::Gitlab::Utils::StrongMemoize
+
+        helpers do
+          def token_from_namespace_inheritable
+            strong_memoize(:token_from_namespace_inheritable) do
+              strategies = namespace_inheritable(:authentication)
+              next unless strategies&.any?
+
+              # Extract credentials from the request
+              found = strategies.to_h { |location, _| [location, ::Gitlab::APIAuthentication::TokenLocator.new(location).extract(current_request)] }
+              found.filter! { |location, raw| raw }
+              next unless found.any?
+
+              # Specifying multiple credentials is an error
+              # https://gitlab.com/gitlab-org/gitlab/-/merge_requests/38627#note_475984136
+              bad_request!('Found more than one set of credentials') if found.size > 1
+
+              location, raw = found.first
+              set_current_token(raw)
+              find_token_from_raw_credentials(strategies[location], raw)
+            end
+
+          rescue ::Gitlab::Auth::UnauthorizedError
+            # TODO: this should be rescued and converted by the exception handling middleware
+            # https://gitlab.com/gitlab-org/gitlab/-/merge_requests/38627#note_475174516
+            unauthorized!
+          end
+
+          def access_token_from_namespace_inheritable
+            token = token_from_namespace_inheritable
+            return unless token.is_a? PersonalAccessToken
+
+            ::PersonalAccessTokens::LastUsedService.new(token).execute
+
+            token
+          end
+
+          def user_from_namespace_inheritable
+            token = token_from_namespace_inheritable
+            return token if token.is_a? DeployToken
+
+            token&.user
+          end
+
+          def ci_build_from_namespace_inheritable
+            token = token_from_namespace_inheritable
+            token if token.is_a?(::Ci::Build)
+          end
+
+          private
+
+          def set_current_token(raw)
+            self.current_token = raw.password
+          end
+
+          def find_token_from_raw_credentials(token_types, raw)
+            token_types.each do |token_type|
+              # Resolve a token from the raw credentials
+              token = ::Gitlab::APIAuthentication::TokenResolver.new(token_type).resolve(raw)
+              return token if token
+            end
+
+            # If a request provides credentials via an allowed transport, the
+            # credentials must be valid. If we reach this point, the credentials
+            # must not be valid credentials of an allowed type.
+            raise ::Gitlab::Auth::UnauthorizedError
+          end
+        end
+      end
+    end
+  end
+end
+
+
+===== FILE: /gitlab/app/controllers/sessions_controller.rb =====
+# frozen_string_literal: true
+
+class SessionsController < Devise::SessionsController
+  include InternalRedirect
+  include AuthenticatesWithTwoFactor
+  include CheckInitialSetup
+  include Devise::Controllers::Rememberable
+  include Recaptcha::Adapters::ViewMethods
+  include Recaptcha::Adapters::ControllerMethods
+  include RendersLdapServers
+  include KnownSignIn
+  include Gitlab::Utils::StrongMemoize
+  include OneTrustCSP
+  include BizibleCSP
+  include VerifiesWithEmail
+  include PreferredLanguageSwitcher
+  include SkipsAlreadySignedInMessage
+  include AcceptsPendingInvitations
+  include SynchronizeBroadcastMessageDismissals
+  extend ::Gitlab::Utils::Override
+
+  skip_before_action :check_two_factor_requirement, only: [:destroy]
+  skip_before_action :check_password_expiration, only: [:destroy]
+
+  prepend_before_action :check_initial_setup, only: [:new]
+  prepend_before_action :authenticate_with_two_factor,
+    if: -> { action_name == 'create' && two_factor_enabled? }
+  prepend_before_action :check_captcha, only: [:create]
+  prepend_before_action :store_redirect_uri, only: [:new]
+  prepend_before_action :require_no_authentication_without_flash, only: [:new, :create]
+  prepend_before_action :ensure_password_authentication_enabled!,
+    if: -> { action_name == 'create' && password_based_login? }
+  before_action :auto_sign_in_with_provider, only: [:new]
+  before_action :init_preferred_language, only: :new
+  before_action :store_unauthenticated_sessions, only: [:new]
+  before_action :save_failed_login, if: :action_new_and_failed_login?
+  before_action :load_recaptcha
+  before_action :set_invite_params, only: [:new]
+
+  after_action :log_failed_login, if: :action_new_and_failed_login?
+  after_action :verify_known_sign_in, only: [:create]
+
+  helper_method :captcha_enabled?, :captcha_on_login_required?, :onboarding_status_tracking_label
+
+  # protect_from_forgery is already prepended in ApplicationController but
+  # authenticate_with_two_factor which signs in the user is prepended before
+  # that here.
+  # We need to make sure CSRF token is verified before authenticating the user
+  # because Devise.clean_up_csrf_token_on_authentication is set to true by
+  # default to avoid CSRF token fixation attacks. Authenticating the user first
+  # would cause the CSRF token to be cleared and then
+  # RequestForgeryProtection#verify_authenticity_token would fail because of
+  # token mismatch.
+  protect_from_forgery with: :exception, prepend: true, except: :destroy
+
+  feature_category :system_access
+  urgency :low
+
+  CAPTCHA_HEADER = 'X-GitLab-Show-Login-Captcha'
+  MAX_FAILED_LOGIN_ATTEMPTS = 5
+  PRESERVE_COOKIES = %w[current_signin_tab preferred_language].freeze
+
+  def new
+    set_minimum_password_length
+
+    super
+  end
+
+  def create
+    super do |resource|
+      # User has successfully signed in, so clear any unused reset token
+      resource.update(reset_password_token: nil, reset_password_sent_at: nil) if resource.reset_password_token.present?
+
+      if resource.deactivated?
+        resource.activate
+        flash[:notice] = _('Welcome back! Your account had been deactivated due to inactivity but is now reactivated.')
+      else
+        # hide the default signed-in notification
+        flash[:notice] = nil
+      end
+
+      accept_pending_invitations
+
+      synchronize_broadcast_message_dismissals(current_user)
+
+      log_audit_event(current_user, resource, with: authentication_method)
+      log_user_activity(current_user)
+    end
+  end
+
+  def destroy
+    headers['Clear-Site-Data'] = '"cache", "storage", "executionContexts", "clientHints"'
+    Gitlab::AppLogger.info("User Logout: username=#{current_user.username} ip=#{request.remote_ip}")
+
+    super
+
+    # hide the signed_out notice
+    flash[:notice] = nil
+
+    # cookies must be deleted after super call
+    # Warden sets some cookies for deletion, this will not override those settings
+    cookies.each do |cookie|
+      next if PRESERVE_COOKIES.include?(cookie[0])
+
+      cookies.delete(cookie[0])
+    end
+  end
+
+  private
+
+  override :after_pending_invitations_hook
+  def after_pending_invitations_hook
+    member = resource.members.last
+
+    store_location_for(:user, polymorphic_path(member.source)) if member
+  end
+
+  def captcha_enabled?
+    request.headers[CAPTCHA_HEADER] && helpers.recaptcha_enabled?
+  end
+
+  def captcha_on_login_required?
+    helpers.recaptcha_enabled_on_login? && unverified_anonymous_user?
+  end
+
+  # From https://github.com/plataformatec/devise/wiki/How-To:-Use-Recaptcha-with-Devise#devisepasswordscontroller
+  def check_captcha
+    return unless user_params[:password].present?
+    return unless captcha_enabled? || captcha_on_login_required?
+    return unless Gitlab::Recaptcha.load_configurations!
+
+    if verify_recaptcha
+      increment_successful_login_captcha_counter
+    else
+      increment_failed_login_captcha_counter
+
+      self.resource = resource_class.new
+      flash[:alert] = _('There was an error with the reCAPTCHA. Please solve the reCAPTCHA again.')
+      flash.delete :recaptcha_error
+
+      add_gon_variables
+
+      respond_with_navigational(resource) { render :new }
+    end
+  end
+
+  def increment_failed_login_captcha_counter
+    Gitlab::Metrics.counter(
+      :failed_login_captcha_total,
+      'Number of failed CAPTCHA attempts for logins'
+    ).increment
+  end
+
+  def increment_successful_login_captcha_counter
+    Gitlab::Metrics.counter(
+      :successful_login_captcha_total,
+      'Number of successful CAPTCHA attempts for logins'
+    ).increment
+  end
+
+  ##
+  # We do have some duplication between lib/gitlab/auth/activity.rb here, but
+  # leaving this method here because of backwards compatibility.
+  #
+  def login_counter
+    @login_counter ||= Gitlab::Metrics.counter(:user_session_logins_total, 'User sign in count')
+  end
+
+  def log_failed_login
+    Gitlab::AppLogger.info("Failed Login: username=#{user_params[:login]} ip=#{request.remote_ip}")
+  end
+
+  def action_new_and_failed_login?
+    action_name == 'new' && failed_login?
+  end
+
+  def save_failed_login
+    session[:failed_login_attempts] ||= 0
+    session[:failed_login_attempts] += 1
+  end
+
+  def failed_login?
+    (options = request.env["warden.options"]) && options[:action] == "unauthenticated"
+  end
+
+  # counting sessions per IP lets us check if there are associated multiple
+  # anonymous sessions with one IP and prevent situations when there are
+  # multiple attempts of logging in
+  def store_unauthenticated_sessions
+    return if current_user
+
+    Gitlab::AnonymousSession.new(request.remote_ip).count_session_ip
+  end
+
+  # Handle an "initial setup" state, where there's only one user, it's an admin,
+  # and they require a password change.
+  def check_initial_setup
+    return unless in_initial_setup_state?
+
+    redirect_to new_admin_initial_setup_path
+  end
+
+  def ensure_password_authentication_enabled!
+    render_403 unless Gitlab::CurrentSettings.password_authentication_enabled_for_web?
+  end
+
+  def password_based_login?
+    user_params[:login].present? || user_params[:password].present?
+  end
+
+  def user_params
+    params.require(:user).permit(:login, :password, :remember_me, :otp_attempt, :device_response)
+  end
+
+  def find_user
+    strong_memoize(:find_user) do
+      if session[:otp_user_id] && user_params[:login]
+        User.by_login(user_params[:login]).find_by_id(session[:otp_user_id])
+      elsif session[:otp_user_id]
+        User.find(session[:otp_user_id])
+      elsif user_params[:login]
+        User.find_by_login(user_params[:login])
+      end
+    end
+  end
+
+  def stored_redirect_uri
+    @redirect_to ||= stored_location_for(:redirect)
+  end
+
+  def store_redirect_uri
+    redirect_uri =
+      if request.referer.present? && (params['redirect_to_referer'] == 'yes')
+        URI(request.referer)
+      else
+        URI(request.url)
+      end
+
+    # Prevent a 'you are already signed in' message directly after signing:
+    # we should never redirect to '/users/sign_in' after signing in successfully.
+    return true if redirect_uri.path == new_user_session_path
+
+    redirect_to = redirect_uri.to_s if host_allowed?(redirect_uri)
+
+    @redirect_to = redirect_to
+    store_location_for(:redirect, redirect_to)
+  end
+
+  def two_factor_enabled?
+    find_user&.two_factor_enabled?
+  end
+
+  def auto_sign_in_with_provider
+    return unless Gitlab::Auth.omniauth_enabled?
+
+    provider = Gitlab.config.omniauth.auto_sign_in_with_provider
+    return unless provider.present?
+
+    # If a "auto_sign_in" query parameter is set to a falsy value, don't auto sign-in.
+    # Otherwise, the default is to auto sign-in.
+    return if Gitlab::Utils.to_boolean(params[:auto_sign_in]) == false
+
+    # Auto sign in with an Omniauth provider only if the standard "you need to sign-in" alert is
+    # registered or no alert at all. In case of another alert (such as a blocked user), it is safer
+    # to do nothing to prevent redirection loops with certain Omniauth providers.
+    return unless flash[:alert].blank? || flash[:alert] == I18n.t('devise.failure.unauthenticated')
+
+    # Prevent alert from popping up on the first page shown after authentication.
+    flash[:alert] = nil
+
+    @provider_path = omniauth_authorize_path(:user, provider)
+    render 'devise/sessions/redirect_to_provider', layout: false
+  end
+
+  def valid_otp_attempt?(user)
+    otp_validation_result =
+      ::Users::ValidateManualOtpService.new(user).execute(user_params[:otp_attempt])
+    return true if otp_validation_result[:status] == :success
+
+    user.invalidate_otp_backup_code!(user_params[:otp_attempt])
+  end
+
+  def audit_event_name_for_authentication_method(method)
+    case method
+    when AuthenticationEvent::TWO_FACTOR
+      'authenticated_with_two_factor'
+    when AuthenticationEvent::TWO_FACTOR_WEBAUTHN
+      'authenticated_with_webauthn'
+    else
+      'authenticated_with_password'
+    end
+  end
+
+  def log_audit_event(user, resource, options = {})
+    Gitlab::AppLogger.info(
+      "Successful Login: username=#{resource.username} ip=#{request.remote_ip} " \
+        "method=#{options[:with]} admin=#{resource.admin?}"
+    )
+
+    event_name = audit_event_name_for_authentication_method(options[:with] || AuthenticationEvent::STANDARD)
+    audit_context = {
+      name: event_name,
+      author: user,
+      scope: user,
+      target: user,
+      message: "Signed in with #{options[:with]} authentication",
+      authentication_event: true,
+      authentication_provider: options[:with],
+      additional_details: {
+        with: options[:with]
+      }
+    }
+    ::Gitlab::Audit::Auditor.audit(audit_context)
+  end
+
+  def log_user_activity(user)
+    login_counter.increment
+    Users::ActivityService.new(author: user).execute
+  end
+
+  def load_recaptcha
+    Gitlab::Recaptcha.load_configurations!
+  end
+
+  def unverified_anonymous_user?
+    exceeded_failed_login_attempts? || exceeded_anonymous_sessions?
+  end
+
+  def exceeded_failed_login_attempts?
+    session.fetch(:failed_login_attempts, 0) > MAX_FAILED_LOGIN_ATTEMPTS
+  end
+
+  def exceeded_anonymous_sessions?
+    Gitlab::AnonymousSession.new(request.remote_ip).session_count >= MAX_FAILED_LOGIN_ATTEMPTS
+  end
+
+  def authentication_method
+    if user_params[:otp_attempt]
+      AuthenticationEvent::TWO_FACTOR
+    elsif user_params[:device_response]
+      AuthenticationEvent::TWO_FACTOR_WEBAUTHN
+    else
+      AuthenticationEvent::STANDARD
+    end
+  end
+
+  def set_invite_params
+    @invite_email = ActionController::Base.helpers.sanitize(params[:invite_email])
+  end
+
+  # overridden by EE module
+  def onboarding_status_tracking_label; end
+end
+
+SessionsController.prepend_mod_with('SessionsController')
+
+
+===== FILE: /gitlab/app/controllers/registrations_controller.rb =====
+# frozen_string_literal: true
+
+class RegistrationsController < Devise::RegistrationsController
+  include Recaptcha::Adapters::ControllerMethods
+  include AcceptsPendingInvitations
+  include RecaptchaHelper
+  include InvisibleCaptchaOnSignup
+  include OneTrustCSP
+  include BizibleCSP
+  include PreferredLanguageSwitcher
+  include Gitlab::Tracking::Helpers::WeakPasswordErrorEvent
+  include SkipsAlreadySignedInMessage
+  include Gitlab::RackLoadBalancingHelpers
+  include ::Gitlab::Utils::StrongMemoize
+  include Onboarding::Redirectable
+
+  layout 'devise'
+
+  prepend_before_action :initialize_timer, only: :create
+  prepend_before_action :check_captcha, only: :create
+  before_action :ensure_first_name_and_last_name_not_empty, only: :create
+  before_action :ensure_destroy_prerequisites_met, only: [:destroy]
+  before_action :init_preferred_language, only: :new
+  before_action :load_recaptcha, only: :new
+  before_action only: [:create] do
+    check_rate_limit!(:user_sign_up, scope: request.ip)
+    invite_email # set for failure path so we still remember we are invite in form
+  end
+
+  feature_category :instance_resiliency
+
+  helper_method :arkose_labs_enabled?, :preregistration_tracking_label, :onboarding_status_presenter
+
+  def new
+    @resource = build_resource
+    set_invite_params
+  end
+
+  def create
+    store_duration(:set_resource_fields) { set_resource_fields }
+
+    devise_call_start_time = current_monotonic_time
+
+    super do |new_user|
+      if new_user.persisted?
+        store_duration(:devise_create_user, devise_call_start_time)
+        store_duration(:after_successful_create_hook) { after_successful_create_hook(new_user) }
+      else
+        store_duration(:track_error) { track_error(new_user) }
+      end
+    end
+    # Devise sets a flash message on both successful & failed signups,
+    # but we only want to show a message if the resource is blocked by a pending approval.
+    flash[:notice] = nil unless allow_flash_content?(resource)
+    log_registration_metrics
+  rescue Gitlab::Access::AccessDeniedError
+    redirect_to(new_user_session_path)
+  end
+
+  def destroy
+    if current_user.required_terms_not_accepted?
+      redirect_to profile_account_path, status: :see_other,
+        alert: s_('Profiles|You must accept the Terms of Service in order to perform this action.')
+      return
+    end
+
+    if destroy_confirmation_valid?
+      current_user.delete_async(deleted_by: current_user)
+      session.try(:destroy)
+      redirect_to new_user_session_path, status: :see_other, notice: s_('Profiles|Account scheduled for removal.')
+    else
+      redirect_to profile_account_path, status: :see_other, alert: destroy_confirmation_failure_message
+    end
+  end
+
+  protected
+
+  def persist_accepted_terms_if_required(new_user)
+    return unless Gitlab::CurrentSettings.current_application_settings.enforce_terms?
+
+    terms = ApplicationSetting::Term.latest
+    Users::RespondToTermsService.new(new_user, terms).execute(accepted: true)
+  end
+
+  def destroy_confirmation_valid?
+    if current_user.confirm_deletion_with_password?
+      current_user.valid_password?(params[:password])
+    else
+      current_user.username == params[:username]
+    end
+  end
+
+  def destroy_confirmation_failure_message
+    if current_user.confirm_deletion_with_password?
+      s_('Profiles|Invalid password')
+    else
+      s_('Profiles|Invalid username')
+    end
+  end
+
+  def build_resource(hash = nil)
+    super
+  end
+
+  # overridden by EE module
+  def after_successful_create_hook(user)
+    store_duration(:accept_pending_invitations) { accept_pending_invitations }
+    store_duration(:persist_accepted_terms_if_required) { persist_accepted_terms_if_required(user) }
+    store_duration(:execute_system_hooks) { execute_system_hooks(user) }
+    store_duration(:notify_new_instance_access_request) { notify_new_instance_access_request(user) }
+    store_duration(:track_successful_user_creation) { track_successful_user_creation(user) }
+  end
+
+  def execute_system_hooks(user)
+    SystemHooksService.new.execute_hooks_for(user, :create)
+  end
+
+  def notify_new_instance_access_request(user)
+    return unless pending_approval?
+
+    NotificationService.new.new_instance_access_request(user)
+  end
+
+  def after_sign_up_path_for(user)
+    Gitlab::AppLogger.info(user_created_message(confirmed: user.confirmed?))
+
+    # Member#accept_invite! operates on the member record to change the association, so the user needs reloaded
+    # to update the collection.
+    user.reset
+    after_sign_up_path(user)
+  end
+
+  def after_inactive_sign_up_path_for(resource)
+    Gitlab::AppLogger.info(user_created_message)
+    return new_user_session_path(anchor: 'login-pane') if resource.blocked_pending_approval?
+    return dashboard_projects_path if Gitlab::CurrentSettings.email_confirmation_setting_soft?
+
+    # when email_confirmation_setting is set to `hard`, path to redirect is saved
+    # after user confirms and comes back, he will be redirected
+    store_location_for(:redirect, after_sign_up_path(resource))
+
+    if identity_verification_enabled?
+      session[:verification_user_id] = resource.id # This is needed to find the user on the identity verification page
+      load_balancer_stick_request(::User, :user, resource.id)
+
+      return identity_verification_redirect_path
+    end
+
+    Gitlab::Tracking.event(self.class.name, 'render', user: resource)
+    users_almost_there_path(email: resource.email)
+  end
+
+  private
+
+  def current_monotonic_time
+    ::Gitlab::Metrics::System.monotonic_time
+  end
+
+  def format_duration(duration)
+    duration.round(Gitlab::InstrumentationHelper::DURATION_PRECISION)
+  end
+
+  def initialize_timer
+    @overall_start_time = current_monotonic_time
+  end
+
+  def duration_statistics
+    @duration_statistics ||= {}
+  end
+
+  def store_duration(operation_name, start = nil, &block)
+    start ||= current_monotonic_time
+    output = yield if block
+    duration_key = :"#{operation_name}_duration_s"
+    duration_statistics[duration_key] = format_duration(current_monotonic_time - start)
+    output
+  rescue StandardError => e
+    # Log timing failure but don't break registration
+    Gitlab::AppJsonLogger.warn("Timing instrumentation failed for #{operation_name}: #{e.message}")
+    output
+  end
+
+  def log_registration_metrics
+    overall_duration = format_duration(current_monotonic_time - @overall_start_time)
+
+    Gitlab::AppJsonLogger.info(
+      event: 'user_registration_duration',
+      total_duration_s: overall_duration,
+      **@duration_statistics
+    )
+  rescue StandardError => e
+    # Log timing failure but don't break registration
+    Gitlab::AppJsonLogger.warn("Error logging registration metrics: #{e.message}")
+  end
+
+  def onboarding_status_presenter
+    Onboarding::StatusPresenter.new(onboarding_status_params, session['user_return_to'], resource)
+  end
+  strong_memoize_attr :onboarding_status_presenter
+
+  # rubocop:disable Gitlab/NoCodeCoverageComment -- Fully tested in EE and tested in Foss through feature specs in spec/features/invites_spec.rb
+  # :nocov:
+  def onboarding_status_params
+    # Onboarding::StatusPresenter does not use any params in CE, we'll override in EE
+    {}
+  end
+  # rubocop:enable Gitlab/NoCodeCoverageComment
+
+  def allow_flash_content?(user)
+    user.blocked_pending_approval? || onboarding_status_presenter.single_invite?
+  end
+
+  def track_successful_user_creation(user)
+    label = user_invited? ? 'invited' : 'signup'
+    Gitlab::Tracking.event(self.class.name, 'create_user', label: label, user: user)
+  end
+
+  def ensure_destroy_prerequisites_met
+    if current_user.solo_owned_groups.present?
+      redirect_to profile_account_path, status: :see_other,
+        alert: s_('Profiles|You must transfer ownership or delete groups ' \
+          'you are an owner of before you can delete your account')
+    end
+  end
+
+  def user_created_message(confirmed: false)
+    "User Created: username=#{resource.username} email=#{resource.email} ip=#{request.remote_ip} confirmed:#{confirmed}"
+  end
+
+  def ensure_correct_params!
+    # To avoid duplicate form fields on the login page, the registration form
+    # names fields using `new_user`, but Devise still wants the params in
+    # `user`.
+    if params["new_#{resource_name}"].present? && params[resource_name].blank?
+      params[resource_name] = params.delete(:"new_#{resource_name}")
+    end
+  end
+
+  def check_captcha
+    set_current_organization
+    return unless show_recaptcha_sign_up?
+    return unless Gitlab::Recaptcha.load_configurations!
+
+    return if verify_recaptcha
+
+    flash[:alert] = _('There was an error with the reCAPTCHA. Please solve the reCAPTCHA again.')
+    flash.delete :recaptcha_error
+    add_gon_variables
+    set_minimum_password_length
+    render action: 'new'
+  end
+
+  def ensure_first_name_and_last_name_not_empty
+    first_name = params.dig(resource_name, :first_name) || params.dig("new_#{resource_name}", :first_name)
+    last_name = params.dig(resource_name, :last_name) || params.dig("new_#{resource_name}", :last_name)
+
+    return if first_name.present? && last_name.present?
+
+    resource.errors.add(_('First name'), _("cannot be blank")) if first_name.blank?
+    resource.errors.add(_('Last name'), _("cannot be blank")) if last_name.blank?
+
+    render action: 'new'
+  end
+
+  def pending_approval?
+    return false unless Gitlab::CurrentSettings.require_admin_approval_after_user_signup
+
+    resource.blocked_pending_approval?
+  end
+
+  def sign_up_params_attributes
+    [:username, :email, :name, :first_name, :last_name, :password]
+  end
+
+  def sign_up_params
+    ensure_correct_params!
+    params.require(:user).permit(sign_up_params_attributes)
+  end
+
+  def resource_name
+    :user
+  end
+
+  def resource
+    @resource ||= Users::RegistrationsBuildService
+                    .new(current_user, sign_up_params.merge({ skip_confirmation: skip_confirmation?,
+                                                              preferred_language: preferred_language,
+                                                              organization_id: Current.organization.id }))
+                    .execute
+  end
+
+  def devise_mapping
+    @devise_mapping ||= Devise.mappings[:user]
+  end
+
+  def skip_confirmation?
+    registered_with_invite_email?
+  end
+
+  def registered_with_invite_email?
+    invite_email = session.delete(:invite_email)
+
+    sign_up_params[:email] == invite_email
+  end
+  strong_memoize_attr :registered_with_invite_email?
+
+  def load_recaptcha
+    Gitlab::Recaptcha.load_configurations!
+  end
+
+  # overridden by EE module
+  def set_resource_fields
+    return unless set_blocked_pending_approval?
+
+    resource.state = User::BLOCKED_PENDING_APPROVAL_STATE
+  end
+
+  def set_blocked_pending_approval?
+    Gitlab::CurrentSettings.require_admin_approval_after_user_signup
+  end
+
+  def set_invite_params
+    resource.email = invite_email if resource.email.blank? && params[:invite_email].present?
+  end
+
+  def invite_email
+    ActionController::Base.helpers.sanitize(params[:invite_email])
+  end
+  strong_memoize_attr :invite_email
+
+  def user_invited?
+    !!member_id
+  end
+
+  def member_id
+    @member_id ||= session.delete(:originating_member_id)
+  end
+
+  def after_pending_invitations_hook
+    return unless member_id
+
+    # if invited multiple times to different projects, only the email clicked will be counted as accepted
+    # for the specific member on a project or group
+    member = resource.members.find_by(id: member_id) # rubocop: disable CodeReuse/ActiveRecord
+
+    return unless member
+
+    Gitlab::Tracking.event(self.class.name, 'accepted', label: 'invite_email', user: resource)
+  end
+
+  def context_user
+    current_user
+  end
+
+  def identity_verification_enabled?
+    # overridden by EE module
+    false
+  end
+
+  def identity_verification_redirect_path
+    # overridden by EE module
+  end
+
+  def arkose_labs_enabled?(user:) # rubocop:disable Lint/UnusedMethodArgument -- Param is unused here but used in EE override
+    false
+  end
+
+  def preregistration_tracking_label
+    # overridden by EE module
+  end
+
+  # overridden by EE module
+  def track_error(new_user)
+    track_weak_password_error(new_user, self.class.name, 'create')
+  end
+end
+
+RegistrationsController.prepend_mod_with('RegistrationsController')
+
+
+===== FILE: /gitlab/app/controllers/omniauth_callbacks_controller.rb =====
+# frozen_string_literal: true
+
+class OmniauthCallbacksController < Devise::OmniauthCallbacksController
+  include ActionView::Helpers::TextHelper
+  include AuthenticatesWithTwoFactorForAdminMode
+  include Devise::Controllers::Rememberable
+  include AuthHelper
+  include InitializesCurrentUserMode
+  include KnownSignIn
+  include AcceptsPendingInvitations
+  include Onboarding::Redirectable
+  include InternalRedirect
+  include SafeFormatHelper
+  include SynchronizeBroadcastMessageDismissals
+
+  ACTIVE_SINCE_KEY = 'active_since'
+
+  # Following https://www.rfc-editor.org/rfc/rfc3986.txt
+  # to check for the present of reserved characters
+  # in redirect_fragment
+  INVALID_FRAGMENT_EXP = %r{[;/?:@&=+$,]+}
+
+  InvalidFragmentError = Class.new(StandardError)
+
+  after_action :verify_known_sign_in
+
+  protect_from_forgery except: [:failure] + AuthHelper.saml_providers, with: :exception, prepend: true
+
+  feature_category :system_access
+
+  # To be used in ee version for raising error on user signup if user is from restricted country
+  SignUpFromRestrictedCountyError = Class.new(StandardError)
+
+  def handle_omniauth
+    if ::AuthHelper.saml_providers.include?(oauth['provider'].to_sym)
+      saml
+    elsif ::AuthHelper.oidc_providers.include?(oauth['provider'].to_sym)
+      openid_connect
+    else
+      omniauth_flow(Gitlab::Auth::OAuth)
+    end
+  end
+
+  AuthHelper.providers_for_base_controller.each do |provider|
+    alias_method provider, :handle_omniauth
+  end
+
+  # overridden in EE
+  def openid_connect
+    omniauth_flow(Gitlab::Auth::OAuth)
+  end
+
+  def jwt
+    omniauth_flow(
+      Gitlab::Auth::OAuth,
+      identity_linker: Gitlab::Auth::Jwt::IdentityLinker.new(current_user, oauth, session)
+    )
+  end
+
+  # Extend the standard implementation to also increment
+  # the number of failed sign in attempts
+  def failure
+    update_login_counter_metric(failed_strategy.name, 'failed')
+    log_saml_response if params['SAMLResponse']
+
+    username = params[:username].to_s
+    if username.present? && AuthHelper.form_based_provider?(failed_strategy.name)
+      user = User.find_by_login(username)
+
+      user&.increment_failed_attempts!
+      log_failed_login(username, failed_strategy.name)
+    end
+
+    super
+  end
+
+  # Extend the standard message generation to accept our custom exception
+  def failure_message
+    exception = request.env["omniauth.error"]
+    error = exception.error_reason if exception.respond_to?(:error_reason)
+    error ||= exception.error        if exception.respond_to?(:error)
+    error ||= exception.message      if exception.respond_to?(:message)
+    error ||= request.env["omniauth.error.type"].to_s
+
+    error.to_s.humanize if error
+  end
+
+  def saml
+    log_saml_response
+    omniauth_flow(Gitlab::Auth::Saml)
+  rescue Gitlab::Auth::Saml::IdentityLinker::UnverifiedRequest
+    redirect_unverified_saml_initiation
+  end
+
+  def auth0
+    if oauth['uid'].blank?
+      fail_auth0_login
+    else
+      handle_omniauth
+    end
+  end
+
+  def salesforce
+    if oauth.dig('extra', 'email_verified')
+      handle_omniauth
+    else
+      fail_salesforce_login
+    end
+  end
+
+  def atlassian_oauth2
+    omniauth_flow(Gitlab::Auth::Atlassian)
+  end
+
+  private
+
+  def verify_redirect_fragment(fragment)
+    if URI.decode_uri_component(fragment).match(INVALID_FRAGMENT_EXP)
+      raise InvalidFragmentError
+    else
+      fragment
+    end
+  end
+
+  def track_event(user, provider, status)
+    log_audit_event(user, with: provider)
+    update_login_counter_metric(provider, status)
+  end
+
+  def update_login_counter_metric(provider, status)
+    omniauth_login_counter.increment(omniauth_provider: provider, status: status)
+  end
+
+  def omniauth_login_counter
+    Gitlab::Auth::OAuth::BeforeRequestPhaseOauthLoginCounterIncrement.counter
+  end
+
+  def log_failed_login(user, provider)
+    # overridden in EE
+  end
+
+  def after_omniauth_failure_path_for(scope)
+    if Gitlab::CurrentSettings.admin_mode
+      return new_admin_session_path if current_user_mode.admin_mode_requested?
+    end
+
+    super
+  end
+
+  def store_redirect_to
+    # overridden in EE
+  end
+
+  def omniauth_flow(auth_module, identity_linker: nil)
+    if fragment = request.env.dig('omniauth.params', 'redirect_fragment').presence
+      store_redirect_fragment(fragment)
+    end
+
+    store_redirect_to
+
+    if current_user
+      return render_403 unless link_provider_allowed?(oauth['provider'])
+
+      set_session_active_since(oauth['provider']) if ::AuthHelper.saml_providers.include?(oauth['provider'].to_sym)
+      track_event(current_user, oauth['provider'], 'succeeded')
+
+      handle_step_up_auth
+
+      if Gitlab::CurrentSettings.admin_mode
+        return admin_mode_flow(auth_module::User) if current_user_mode.admin_mode_requested?
+      end
+
+      identity_linker ||= auth_module::IdentityLinker.new(current_user, oauth, session)
+      return redirect_authorize_identity_link(identity_linker) if identity_linker.authorization_required?
+
+      link_identity(identity_linker)
+
+      current_auth_user = build_auth_user(auth_module::User)
+      set_remember_me(current_user, current_auth_user)
+      # We are also calling this here in the case that devise re-logins and current_user is set
+      synchronize_broadcast_message_dismissals(current_user)
+
+      store_idp_two_factor_status(current_auth_user.bypass_two_factor?)
+
+      if identity_linker.changed?
+        redirect_identity_linked
+      elsif identity_linker.failed?
+        redirect_identity_link_failed(identity_linker.error_message)
+      else
+        redirect_identity_exists
+      end
+    else
+      sign_in_user_flow(auth_module::User)
+    end
+  rescue InvalidFragmentError
+    fail_login_with_message("Invalid state")
+  end
+
+  def link_identity(identity_linker)
+    identity_linker.link
+  end
+
+  def redirect_identity_exists
+    redirect_to after_sign_in_path_for(current_user)
+  end
+
+  def redirect_identity_link_failed(error_message)
+    redirect_to profile_account_path,
+      notice: safe_format(_("Authentication failed: %{error_message}"), error_message: error_message)
+  end
+
+  def redirect_identity_linked
+    redirect_to profile_account_path, notice: _('Authentication method updated')
+  end
+
+  def redirect_authorize_identity_link(identity_linker)
+    state = SecureRandom.uuid
+    session[:identity_link_state] = state
+    session[:identity_link_provider] = identity_linker.provider
+    session[:identity_link_extern_uid] = identity_linker.uid
+
+    redirect_to new_user_settings_identities_path(state: state)
+  end
+
+  def build_auth_user(auth_user_class)
+    strong_memoize_with(:build_auth_user, auth_user_class) do
+      auth_user_class.new(oauth, build_auth_user_params)
+    end
+  end
+
+  # Overridden in EE
+  def build_auth_user_params
+    { organization_id: Current.organization.id }
+  end
+
+  # Overridden in EE
+  def set_session_active_since(id); end
+
+  def sign_in_user_flow(auth_user_class)
+    auth_user = build_auth_user(auth_user_class)
+    new_user = allowed_new_user?(auth_user)
+    @user = auth_user.find_and_update!
+
+    if auth_user.valid_sign_in?
+      # In this case the `#current_user` would not be set. So we can't fetch it
+      # from that in `#context_user`. Pushing it manually here makes the information
+      # available in the logs for this request.
+      Gitlab::ApplicationContext.push(user: @user)
+      track_event(@user, oauth['provider'], 'succeeded')
+      Gitlab::Tracking.event(self.class.name, "#{oauth['provider']}_sso", user: @user) if new_user
+
+      set_remember_me(@user, auth_user)
+      set_session_active_since(oauth['provider']) if ::AuthHelper.saml_providers.include?(oauth['provider'].to_sym)
+
+      if @user.two_factor_enabled? && !auth_user.bypass_two_factor?
+        prompt_for_two_factor(@user)
+        store_idp_two_factor_status(false)
+      else
+        if @user.deactivated?
+          @user.activate
+          flash[:notice] =
+            _('Welcome back! Your account had been deactivated due to inactivity but is now reactivated.')
+        end
+
+        # session variable for storing bypass two-factor request from IDP
+        store_idp_two_factor_status(auth_user.bypass_two_factor?)
+
+        accept_pending_invitations(user: @user) if new_user
+        synchronize_broadcast_message_dismissals(@user) unless new_user
+        persist_accepted_terms_if_required(@user) if new_user
+
+        perform_registration_tasks(@user, oauth['provider']) if new_user
+
+        enqueue_after_sign_in_workers(@user, auth_user)
+
+        sign_in_and_redirect_or_verify_identity(@user, auth_user, new_user)
+      end
+    else
+      fail_login(@user)
+    end
+  rescue Gitlab::Auth::OAuth::User::IdentityWithUntrustedExternUidError
+    handle_identity_with_untrusted_extern_uid
+  rescue Gitlab::Auth::OAuth::User::SigninDisabledForProviderError
+    handle_disabled_provider
+  rescue Gitlab::Auth::OAuth::User::SignupDisabledError
+    handle_signup_error
+  rescue SignUpFromRestrictedCountyError
+    handle_signup_from_restricted_country_error
+  end
+
+  def handle_signup_from_restricted_country_error
+    sign_up_message = "Sign up with Jihu"
+    jihu_url = ActionController::Base.helpers.link_to _(sign_up_message), "https://about.gitlab.com/pricing/faq-jihu/",
+      class: 'gl-link'
+    message = safe_format(_('It looks like you are visiting GitLab from Mainland China, Macau, or Hong Kong.' \
+      'We advise you to %{jihu_url} before continuing.'), jihu_url: jihu_url)
+
+    flash[:alert] = sanitize(message)
+
+    redirect_to new_user_session_path
+  end
+
+  def handle_signup_error
+    redirect_path = new_user_session_path
+    label = Gitlab::Auth::OAuth::Provider.label_for(oauth['provider'])
+    simple_url = Settings.gitlab.url.sub(%r{^https?://(www\.)?}i, '')
+    message = [
+      safe_format(_('Signing in using your %{label} account without a pre-existing ' \
+        'account in %{simple_url} is not allowed.'), label: label, simple_url: simple_url)
+    ]
+
+    if Gitlab::CurrentSettings.allow_signup?
+      redirect_path = new_user_registration_path
+      doc_pair = tag_pair(view_context.link_to(
+        '',
+        help_page_path('user/profile/_index.md', anchor: 'sign-in-services')),
+        :doc_start,
+        :doc_end
+      )
+      message << safe_format(
+        _('Create an account in %{simple_url} first, and then %{doc_start}connect it to ' \
+          'your %{label} account%{doc_end}.'),
+        doc_pair,
+        label: label,
+        simple_url: simple_url
+      )
+    end
+
+    flash[:alert] = sanitize(message.join(' '))
+
+    redirect_to redirect_path
+  end
+
+  def oauth
+    @oauth ||= request.env['omniauth.auth']
+  end
+
+  def fail_login(user)
+    log_failed_login(user.username, oauth['provider'])
+
+    @provider = Gitlab::Auth::OAuth::Provider.label_for(params[:action])
+    @error = user.errors.full_messages.to_sentence
+
+    render 'errors/omniauth_error', layout: "oauth_error", status: :unprocessable_entity
+  end
+
+  def fail_auth0_login
+    fail_login_with_message(_('Wrong extern UID provided. Make sure Auth0 is configured correctly.'))
+  end
+
+  def fail_salesforce_login
+    fail_login_with_message(_('Email not verified. Please verify your email in Salesforce.'))
+  end
+
+  def fail_login_with_message(message)
+    flash[:alert] = message
+
+    redirect_to new_user_session_path
+  end
+
+  def redirect_unverified_saml_initiation
+    redirect_to profile_account_path, notice: _('Request to link SAML account must be authorized')
+  end
+
+  def handle_identity_with_untrusted_extern_uid
+    label = Gitlab::Auth::OAuth::Provider.label_for(oauth['provider'])
+    flash[:alert] = safe_format(
+      _('Signing in using your %{label} account has been disabled for security reasons. ' \
+        'Please sign in to your GitLab account using another authentication method and ' \
+        'reconnect to your %{label} account.'
+       ),
+      label: label
+    )
+
+    redirect_to new_user_session_path
+  end
+
+  def handle_disabled_provider
+    label = Gitlab::Auth::OAuth::Provider.label_for(oauth['provider'])
+    flash[:alert] = safe_format(_("Signing in using %{label} has been disabled"), label: label)
+
+    redirect_to new_user_session_path
+  end
+
+  def log_audit_event(user, options = {}, name = 'authenticated_with_oauth')
+    return if options[:with].blank?
+
+    provider = options[:with]
+    audit_context = {
+      name: name,
+      author: user,
+      scope: user,
+      target: user,
+      message: "Signed in with #{provider.upcase} authentication",
+      authentication_event: true,
+      authentication_provider: provider,
+      additional_details: {
+        with: provider
+      }
+    }
+    ::Gitlab::Audit::Auditor.audit(audit_context)
+  end
+
+  def set_remember_me(user, auth_user)
+    return unless remember_me?
+
+    if user.two_factor_enabled? && !auth_user.bypass_two_factor?
+      params[:remember_me] = '1'
+    else
+      remember_me(user)
+    end
+  end
+
+  def remember_me?
+    request_params = request.env['omniauth.params']
+    (request_params['remember_me'] == '1') if request_params.present?
+  end
+
+  def store_redirect_fragment(redirect_fragment)
+    key = stored_location_key_for(:user)
+    location = session[key]
+    if uri = parse_uri(location)
+      uri.fragment = verify_redirect_fragment(redirect_fragment)
+      store_location_for(:user, uri.to_s)
+    end
+  end
+
+  def handle_step_up_auth
+    return if Feature.disabled?(:omniauth_step_up_auth_for_admin_mode, current_user)
+
+    step_up_auth_flow =
+      ::Gitlab::Auth::Oidc::StepUpAuthentication.build_flow(session: session, provider: oauth.provider)
+
+    return unless step_up_auth_flow.enabled_by_config?
+    return unless step_up_auth_flow.requested?
+
+    step_up_auth_flow.evaluate!(oauth.extra.raw_info)
+  end
+
+  def admin_mode_flow(auth_user_class)
+    auth_user = build_auth_user(auth_user_class)
+
+    return fail_admin_mode_invalid_credentials unless omniauth_identity_matches_current_user?
+
+    if current_user.two_factor_enabled? && !auth_user.bypass_two_factor?
+      admin_mode_prompt_for_two_factor(current_user)
+    else
+      # Can only reach here if the omniauth identity matches current user
+      # and current_user is an admin that requested admin mode
+      current_user_mode.enable_admin_mode!(skip_password_validation: true)
+
+      redirect_to stored_location_for(:redirect) || admin_root_path, notice: _('Admin mode enabled')
+    end
+  end
+
+  def omniauth_identity_matches_current_user?
+    current_user.matches_identity?(oauth['provider'], oauth['uid'])
+  end
+
+  def fail_admin_mode_invalid_credentials
+    redirect_to new_admin_session_path, alert: _('Invalid login or password')
+  end
+
+  def persist_accepted_terms_if_required(user)
+    return unless user.persisted?
+    return unless Gitlab::CurrentSettings.current_application_settings.enforce_terms?
+
+    terms = ApplicationSetting::Term.latest
+    Users::RespondToTermsService.new(user, terms).execute(accepted: true)
+  end
+
+  def perform_registration_tasks(user, _provider)
+    store_location_for(:user, after_sign_up_path(user))
+  end
+
+  def onboarding_status_presenter
+    Onboarding::StatusPresenter
+      .new(request.env.fetch('omniauth.params', {}).deep_symbolize_keys, session['user_return_to'], @user)
+  end
+  strong_memoize_attr :onboarding_status_presenter
+
+  # overridden in EE
+  def sign_in_and_redirect_or_verify_identity(user, _, _)
+    sign_in_and_redirect(user, event: :authentication)
+  end
+
+  # overridden in specific EE class
+  def enqueue_after_sign_in_workers(_user, _auth_user)
+    true
+  end
+
+  # overridden in specific EE class
+  def allowed_new_user?(auth_user)
+    auth_user.new?
+  end
+
+  def store_idp_two_factor_status(bypass_2fa)
+    session[:provider_2FA] = true if bypass_2fa
+  end
+
+  def log_saml_response
+    ParameterFilters::SamlResponse.log(params['SAMLResponse'].dup)
+  end
+end
+
+OmniauthCallbacksController.prepend_mod_with('OmniauthCallbacksController')
+
+
+===== FILE: /gitlab/config/initializers/8_devise.rb =====
+# frozen_string_literal: true
+
+require_dependency 'gitlab/auth/devise/strategies/combined_two_factor_authenticatable'
+
+# Use this hook to configure devise mailer, warden hooks and so forth. The first
+# four configuration values can also be set straight in your models.
+Devise.setup do |config|
+  config.warden do |manager|
+    user_scoped_strategies = manager.default_strategies(scope: :user)
+    user_scoped_strategies.delete :two_factor_backupable
+    user_scoped_strategies.delete :two_factor_authenticatable
+    user_scoped_strategies.unshift :combined_two_factor_authenticatable
+  end
+
+  # This is the default. This makes it explicit that Devise loads routes
+  # before eager loading. Disabling this seems to cause an error loading
+  # grape-entity `expose` for some reason.
+  config.reload_routes = true
+
+  # ==> Mailer Configuration
+  # Configure the class responsible to send e-mails.
+  config.mailer = "DeviseMailer"
+
+  # ==> ORM configuration
+  # Load and configure the ORM. Supports :active_record (default) and
+  # :mongoid (bson_ext recommended) by default. Other ORMs may be
+  # available as additional gems.
+  require 'devise/orm/active_record'
+
+  # ==> Configuration for any authentication mechanism
+  # Configure which keys are used when authenticating a user. The default is
+  # just :email. You can configure it to use [:username, :subdomain], so for
+  # authenticating a user, both parameters are required. Remember that those
+  # parameters are used only when authenticating and not when retrieving from
+  # session. If you need permissions, you should implement that in a before filter.
+  # You can also supply a hash where the value is a boolean determining whether
+  # or not authentication should be aborted when the value is not present.
+  config.authentication_keys = [:login]
+
+  # Configure parameters from the request object used for authentication. Each entry
+  # given should be a request method and it will automatically be passed to the
+  # find_for_authentication method and considered in your model lookup. For instance,
+  # if you set :request_keys to [:subdomain], :subdomain will be used on authentication.
+  # The same considerations mentioned for authentication_keys also apply to request_keys.
+  # config.request_keys = []
+
+  # Configure which authentication keys should be case-insensitive.
+  # These keys will be downcased upon creating or modifying a user and when used
+  # to authenticate or find a user. Default is :email.
+  config.case_insensitive_keys = [:email]
+
+  # Configure which authentication keys should have whitespace stripped.
+  # These keys will have whitespace before and after removed upon creating or
+  # modifying a user and when used to authenticate or find a user. Default is :email.
+  config.strip_whitespace_keys = [:email]
+
+  # Tell if authentication through request.params is enabled. True by default.
+  # config.params_authenticatable = true
+
+  # Tell if authentication through HTTP Basic Auth is enabled. False by default.
+  # config.http_authenticatable = false
+
+  # If http headers should be returned for AJAX requests. True by default.
+  # config.http_authenticatable_on_xhr = true
+
+  # The realm used in Http Basic Authentication. "Application" by default.
+  # config.http_authentication_realm = "Application"
+
+  config.reconfirmable = true
+
+  # It will change confirmation, password recovery and other workflows
+  # to behave the same regardless if the e-mail provided was right or wrong.
+  # Does not affect registerable.
+  config.paranoid = true
+
+  # ==> Configuration for :database_authenticatable
+  # For bcrypt, this is the cost for hashing the password and defaults to 10. If
+  # using other encryptors, it sets how many times you want the password re-encrypted.
+  #
+  # Limiting the stretches to just 5 in testing will increase the performance of
+  # your test suite dramatically. However, it is STRONGLY RECOMMENDED to not use
+  # a value less than 10 in other environments. (Note that Devise will ignore
+  # a value of 1 for stretches.)
+
+  config.stretches = Rails.env.test? ? 5 : 13
+
+  # Set up a pepper to generate the encrypted password.
+  # config.pepper = "2ef62d549c4ff98a5d3e0ba211e72cff592060247e3bbbb9f499af1222f876f53d39b39b823132affb32858168c79c1d7741d26499901b63c6030a42129924ef"
+
+  # ==> Configuration for :confirmable
+  # The time you want to give a user to confirm their account. During this time
+  # they will be able to access your application without confirming. Default is 0.days
+  # When allow_unconfirmed_access_for is zero, the user won't be able to sign in without confirming.
+  # You can use this to let your user access some features of your application
+  # without confirming the account, but blocking it after a certain period
+  # (e.g. 3 days).
+  config.allow_unconfirmed_access_for = 3.days
+
+  # A period that the user is allowed to confirm their account before their
+  # token becomes invalid. For example, if set to 1.day, the user can confirm
+  # their account within 1 days after the mail was sent, but on the second day
+  # their account can't be confirmed with the token any more.
+  # Default is nil, meaning there is no restriction on how long a user can take
+  # before confirming their account.
+  config.confirm_within = 1.day
+
+  # Defines which key will be used when confirming an account
+  # config.confirmation_keys = [ :email ]
+
+  # ==> Configuration for :rememberable
+  # The time the user will be remembered without asking for credentials again.
+  # config.remember_for = 2.weeks
+
+  # Invalidates all the remember me tokens when the user signs out.
+  config.expire_all_remember_me_on_sign_out = false
+
+  # If true, extends the user's remember period when remembered via cookie.
+  config.extend_remember_period = true
+
+  # Options to be passed to the created cookie. For instance, you can set
+  # secure: true in order to force SSL only cookies.
+  # config.rememberable_options = {}
+
+  # When set to false, does not sign a user in automatically after their password is
+  # changed. Defaults to true, so a user is signed in automatically after a password
+  # is changed.
+  config.sign_in_after_change_password = false
+
+  # Send a notification email when the user's password is changed
+  config.send_password_change_notification = true
+
+  # Send a notification email when the user's email is changed
+  config.send_email_changed_notification = true
+
+  # ==> Configuration for :validatable
+  # Range for password length. Default is 6..128.
+  config.password_length = 8..128
+
+  # Email regex used to validate email formats. It simply asserts that
+  # an one (and only one) @ exists in the given string. This is mainly
+  # to give user feedback and not to assert the e-mail validity.
+  # config.email_regexp = /\A[^@]+@[^@]+\z/
+
+  # ==> Configuration for :timeoutable
+  # The time you want to timeout the user session without activity. After this
+  # time the user will be asked for credentials again. Default is 30 minutes.
+  # config.timeout_in = 30.minutes
+
+  # ==> Configuration for :lockable
+  # Defines which strategy will be used to lock an account.
+  # :failed_attempts = Locks an account after a number of failed attempts to sign in.
+  # :none            = No lock strategy. You should handle locking by yourself.
+  config.lock_strategy = :failed_attempts
+
+  # Defines which key will be used when locking and unlocking an account
+  config.unlock_keys = [:email]
+
+  # Defines which strategy will be used to unlock an account.
+  # :email = Sends an unlock link to the user email
+  # :time  = Re-enables login after a certain amount of time (see :unlock_in below)
+  # :both  = Enables both strategies
+  # :none  = No unlock strategy. You should handle unlocking by yourself.
+  config.unlock_strategy = :both
+
+  ActiveSupport.on_load(:gitlab_db_load_balancer) do
+    # Number of authentication tries before locking an account if lock_strategy
+    # is failed attempts.
+    config.maximum_attempts = if Gitlab::CurrentSettings.max_login_attempts_column_exists?
+                                (Gitlab::CurrentSettings.max_login_attempts || 10)
+                              else
+                                10
+                              end
+
+    # Time interval to unlock the account if :time is enabled as unlock_strategy.
+    config.unlock_in = if Gitlab::CurrentSettings.failed_login_attempts_unlock_period_in_minutes_column_exists?
+                         (Gitlab::CurrentSettings.failed_login_attempts_unlock_period_in_minutes || 10).minutes
+                       else
+                         10.minutes
+                       end
+  end
+
+  # ==> Configuration for :recoverable
+  #
+  # Defines which key will be used when recovering the password for an account
+  # config.reset_password_keys = [ :email ]
+
+  # Time interval you can reset your password with a reset password key.
+  # Don't put a too small interval or your users won't have the time to
+  # change their passwords.
+  # When someone else invites you to GitLab this time is also used so it should be pretty long.
+  config.reset_password_within = 2.days
+
+  # When set to false, does not sign a user in automatically after their password is
+  # reset. Defaults to true, so a user is signed in automatically after a reset.
+  config.sign_in_after_reset_password = false
+
+  # Authentication through token does not store user in session and needs
+  # to be supplied on each request. Useful if you are using the token as API token.
+  config.skip_session_storage << :token_auth
+
+  # ==> Scopes configuration
+  # Turn scoped views on. Before rendering "sessions/new", it will first check for
+  # "users/sessions/new". It's turned off by default because it's slower if you
+  # are using only default views.
+  # config.scoped_views = false
+
+  # Configure the default scope given to Warden. By default it's the first
+  # devise role declared in your routes (usually :user).
+  config.default_scope = :user # now have an :email scope as well, so set the default
+
+  # Configure sign_out behavior.
+  # Sign_out action can be scoped (i.e. /users/sign_out affects only :user scope).
+  # The default is true, which means any logout action will sign out all active scopes.
+  # config.sign_out_all_scopes = true
+
+  # ==> Navigation configuration
+  # Lists the formats that should be treated as navigational. Formats like
+  # :html, should redirect to the sign in page when the user does not have
+  # access, but formats like :xml or :json, should return 401.
+  #
+  # If you have any extra navigational formats, like :iphone or :mobile, you
+  # should add them to the navigational formats lists.
+  #
+  # The :"*/*" and "*/*" formats below is required to match Internet
+  # Explorer requests.
+  config.navigational_formats = [:"*/*", "*/*", :html, :zip]
+
+  # The default HTTP method used to sign out a resource. Default is :delete.
+  config.sign_out_via = :post
+
+  # ==> OmniAuth
+  # To configure a new OmniAuth provider copy and edit omniauth.rb.sample
+  # selecting the provider you require.
+  # Check the wiki for more information on setting up on your models
+
+  # ==> Warden configuration
+  # If you want to use other strategies, that are not supported by Devise, or
+  # change the failure app, you can configure them inside the config.warden block.
+  #
+  config.warden do |manager|
+    manager.failure_app = Gitlab::DeviseFailure
+  end
+
+  if Gitlab::Auth::Ldap::Config.enabled?
+    Gitlab::Auth::Ldap::Config.available_providers.each do |provider|
+      ldap_config = Gitlab::Auth::Ldap::Config.new(provider)
+      config.omniauth(provider, ldap_config.omniauth_options)
+    end
+  end
+
+  if Gitlab::Auth.omniauth_enabled?
+    Gitlab::OmniauthInitializer.new(config).execute(Gitlab.config.omniauth.providers)
+  end
+end
+
+
+===== FILE: /gitlab/config/initializers/omniauth.rb =====
+# frozen_string_literal: true
+
+if Gitlab::Auth::Ldap::Config.enabled?
+  module OmniAuth::Strategies
+    Gitlab::Auth::Ldap::Config.available_servers.each do |server|
+      # do not redeclare LDAP
+      next if server['provider_name'] == 'ldap'
+
+      const_set(server['provider_class'], Class.new(LDAP))
+    end
+  end
+end
+
+OmniAuth.config.full_host = Gitlab::OmniauthInitializer.full_host
+
+OmniAuth.config.allowed_request_methods = [:post]
+OmniAuth.config.request_validation_phase do |env|
+  Gitlab::RequestForgeryProtection.call(env)
+end
+
+OmniAuth.config.logger = Gitlab::AppLogger
+
+OmniAuth.config.before_request_phase do |env|
+  Gitlab::Auth::OAuth::BeforeRequestPhaseOauthLoginCounterIncrement.call(env)
+  Gitlab::Auth::Oidc::StepUpAuthBeforeRequestPhase.call(env)
+end
+
+
+===== FILE: /gitlab/lib/gitlab/omniauth_initializer.rb =====
+# frozen_string_literal: true
+
+module Gitlab
+  class OmniauthInitializer
+    OAUTH2_TIMEOUT_SECONDS = 10
+    ConfigurationError = Class.new(StandardError)
+
+    def initialize(devise_config)
+      @devise_config = devise_config
+    end
+
+    def execute(providers)
+      providers.each do |provider|
+        name = provider['name'].to_sym
+
+        add_provider_to_devise(name, *arguments_for(provider))
+        setup_provider(name)
+      end
+    end
+
+    class << self
+      def default_arguments_for(provider_name)
+        case provider_name
+        when 'shibboleth'
+          { fail_with_empty_uid: true }
+        when 'google_oauth2'
+          { client_options: { connection_opts: { request: { timeout: OAUTH2_TIMEOUT_SECONDS } } } }
+        when 'gitlab'
+          {
+            authorize_params: { gl_auth_type: 'login' }
+          }
+        when ->(provider_name) { AuthHelper.saml_providers.include?(provider_name.to_sym) }
+          {
+            attribute_statements: ::Gitlab::Auth::Saml::Config.default_attribute_statements
+          }
+        else
+          {}
+        end
+      end
+
+      def full_host
+        proc { |_env| Settings.gitlab['base_url'] }
+      end
+    end
+
+    private
+
+    def add_provider_to_devise(...)
+      @devise_config.omniauth(...)
+    end
+
+    def arguments_for(provider)
+      provider_arguments = []
+
+      %w[app_id app_secret].each do |argument|
+        provider_arguments << provider[argument] if provider[argument]
+      end
+
+      arguments = provider.fetch('args', {})
+      defaults = provider_defaults(provider)
+
+      case arguments
+      when Array
+        # An Array from the configuration will be expanded
+        provider_arguments.concat arguments
+        provider_arguments << defaults unless defaults.empty?
+      when Hash, GitlabSettings::Options
+        verify_saml_cert_arguments!(provider['name'], arguments)
+        hash_arguments = merge_hash_defaults_and_args(defaults, arguments)
+        normalized = normalize_hash_arguments(hash_arguments)
+
+        # A Hash from the configuration will be passed as is.
+        provider_arguments << normalized unless normalized.empty?
+      else
+        # this will prevent the application from starting in development mode.
+        # we still set defaults, and let the application start in prod.
+        Gitlab::ErrorTracking.track_and_raise_for_dev_exception(
+          ConfigurationError.new("Arguments were provided for #{provider['name']}, but not as an array or a hash"),
+          provider_name: provider['name'],
+          arguments_type: arguments.class.name
+        )
+        provider_arguments << defaults unless defaults.empty?
+      end
+
+      provider_arguments
+    end
+
+    def merge_hash_defaults_and_args(defaults, arguments)
+      return arguments.to_hash if defaults.empty?
+
+      revert_merging = Gitlab::Utils.to_boolean(ENV['REVERT_OMNIAUTH_DEFAULT_MERGING'])
+      return arguments.to_hash.deep_symbolize_keys.deep_merge(defaults) if revert_merging
+
+      defaults.deep_merge(arguments.deep_symbolize_keys)
+    end
+
+    def normalize_hash_arguments(args)
+      args.deep_symbolize_keys!
+
+      # Rails 5.1 deprecated the use of string names in the middleware
+      # (https://github.com/rails/rails/commit/83b767ce), so we need to
+      # pass in the actual class to Devise.
+      if args[:strategy_class].is_a?(String)
+        args[:strategy_class] = args[:strategy_class].constantize
+      end
+
+      args
+    end
+
+    def verify_saml_cert_arguments!(provider_name, arguments)
+      return arguments unless AuthHelper.saml_providers.include?(provider_name.to_sym)
+
+      fingerprint = arguments['idp_cert_fingerprint']
+      algorithm = arguments['idp_cert_fingerprint_algorithm']
+
+      return arguments unless fingerprint.present? && algorithm.nil?
+
+      algorithm = AuthHelper.certificate_fingerprint_algorithm(fingerprint)
+
+      return arguments unless algorithm.present?
+
+      arguments['idp_cert_fingerprint_algorithm'] = algorithm
+      arguments
+    end
+
+    def provider_defaults(provider)
+      self.class.default_arguments_for(provider['name'])
+    end
+
+    def omniauth_customized_providers
+      @omniauth_customized_providers ||= build_omniauth_customized_providers
+    end
+
+    # We override this in EE
+    def build_omniauth_customized_providers
+      %i[bitbucket jwt]
+    end
+
+    def setup_provider(provider)
+      case provider
+      when *omniauth_customized_providers
+        require_dependency "omni_auth/strategies/#{provider}"
+      end
+    end
+  end
+end
+
+Gitlab::OmniauthInitializer.prepend_mod_with('Gitlab::OmniauthInitializer')
+
+
+===== FILE: /gitlab/config/initializers/warden.rb =====
+# frozen_string_literal: true
+
+Rails.application.configure do |config|
+  Warden::Manager.after_set_user(scope: :user) do |user, auth, opts|
+    Gitlab::Auth::UniqueIpsLimiter.limit_user!(user)
+    Gitlab::Auth::SessionExpireFromInitEnforcer.new(auth, opts).enforce!
+
+    activity = Gitlab::Auth::Activity.new(opts)
+
+    case opts[:event]
+    when :authentication
+      activity.user_authenticated!
+    when :set_user
+      activity.user_authenticated!
+      activity.user_session_override!
+    when :fetch
+      # We ignore session fetch events
+    else
+      activity.user_session_override!
+    end
+  rescue Gitlab::Auth::TooManyIps
+    throw(:warden, scope: opts[:scope], reason: :too_many_requests) # rubocop:disable Cop/BanCatchThrow
+  end
+
+  Warden::Manager.after_authentication(scope: :user) do |user, auth, opts|
+    ActiveSession.cleanup(user)
+    ActiveSession.set_marketing_user_cookies(auth, user) if ::Gitlab.ee? && ::Gitlab.com?
+    Gitlab::Auth::SessionExpireFromInitEnforcer.new(auth, opts).set_login_time
+    Gitlab::AnonymousSession.new(auth.request.remote_ip).cleanup_session_per_ip_count
+  end
+
+  Warden::Manager.after_set_user(scope: :user, only: :fetch) do |user, auth, opts|
+    ActiveSession.set(user, auth.request)
+  end
+
+  Warden::Manager.before_failure(scope: :user) do |env, opts|
+    Gitlab::Auth::Activity.new(opts).user_authentication_failed!
+  end
+
+  Warden::Manager.before_logout(scope: :user) do |user, auth, opts|
+    ActiveSession.unset_marketing_user_cookies(auth) if ::Gitlab.ee? && ::Gitlab.com?
+
+    user ||= auth.user
+    # Rails CSRF protection may attempt to log out a user before that
+    # user even logs in
+    next unless user
+
+    activity = Gitlab::Auth::Activity.new(opts)
+    tracker = Gitlab::Auth::BlockedUserTracker.new(user, auth)
+
+    ActiveSession.destroy_session(user, auth.request.session.id.private_id) if auth.request.session.id
+    activity.user_session_destroyed!
+
+    ##
+    # It is possible that `before_logout` event is going to be triggered
+    # multiple times during the request lifecycle. We want to increment
+    # metrics and write logs only once in that case.
+    #
+    # 'warden.auth.*' is our custom hash key that follows usual convention
+    # of naming keys in the Rack env hash.
+    #
+    next if auth.env['warden.auth.user.blocked']
+
+    if user.blocked?
+      activity.user_blocked!
+      tracker.log_activity!
+    end
+
+    auth.env['warden.auth.user.blocked'] = true
+  end
+end
+
+
+===== FILE: /gitlab/config/initializers/session_store.rb =====
+# frozen_string_literal: true
+
+# Be sure to restart your server when you modify this file.
+
+require 'gitlab/current_settings'
+
+# allow it to fail: it may do so when create_from_defaults is executed before migrations are actually done
+begin
+  session_expire_delay = Gitlab::CurrentSettings.current_application_settings.session_expire_delay
+  Settings.gitlab['session_expire_delay'] = session_expire_delay || 10080
+rescue StandardError
+  Settings.gitlab['session_expire_delay'] ||= 10080
+end
+
+raw_config = if File.exist?(Rails.root.join('config/session_store.yml'))
+               Rails.application.config_for(:session_store) || {}
+             else
+               {}
+             end
+
+# NOTE: `session_cookie_token_prefix` may be optionally injected into the environment
+session_cookie_token_prefix = raw_config.fetch(:session_cookie_token_prefix, '')
+if Gitlab.config.cell.enabled
+  # NOTE: in the context of cells, the `session_cookie_token_prefix` must adhere to a specific format
+  session_cookie_token_prefix_for_cell = "cell-#{Gitlab.config.cell.id}"
+  if session_cookie_token_prefix.present? && session_cookie_token_prefix != session_cookie_token_prefix_for_cell
+    raise "Given that cells are enabled, the session_cookie_token_prefix must be left blank or specifically set to " \
+      "'#{session_cookie_token_prefix_for_cell}'. Currently it is set to: '#{session_cookie_token_prefix}'."
+  end
+
+  session_cookie_token_prefix = session_cookie_token_prefix_for_cell
+end
+
+cookie_key = if Rails.env.development?
+               cookie_key_prefix = raw_config.fetch(:cookie_key, "_gitlab_session")
+               # If config doesn't exist we preserve the current default behaviour, which is a unique postfix per GDK
+               unique_key = raw_config.fetch(:unique_cookie_key_postfix, true)
+               unique_key ? "#{cookie_key_prefix}_#{Digest::SHA256.hexdigest(Rails.root.to_s)}" : cookie_key_prefix
+             elsif ::Gitlab.ee? && ::Gitlab::Geo.connected? && ::Gitlab::Geo.secondary?
+               "_gitlab_session_geo_#{Digest::SHA256.hexdigest(GeoNode.current_node_name)}"
+             else
+               "_gitlab_session"
+             end
+
+::Redis::Store::Factory.prepend(Gitlab::Patch::RedisStoreFactory)
+
+session_store_class, options = Gitlab::Sessions::StoreBuilder.new(cookie_key, session_cookie_token_prefix).prepare
+
+Rails.application.configure do
+  config.session_store(session_store_class, **options)
+  config.middleware.insert_after session_store_class, Gitlab::Middleware::UnauthenticatedSessionExpiry
+  config.action_dispatch.signed_cookie_salt = Settings['gitlab']['signed_cookie_salt'] || 'signed cookie'
+  config.action_dispatch.authenticated_encrypted_cookie_salt =
+    Settings['gitlab']['authenticated_encrypted_cookie_salt'] || 'authenticated encrypted cookie'
+end
+
+
+===== FILE: /gitlab/config/initializers/doorkeeper.rb =====
+# frozen_string_literal: true
+
+Doorkeeper.configure do
+  # Change the ORM that doorkeeper will use.
+  # Currently supported options are :active_record, :mongoid2, :mongoid3, :mongo_mapper
+  orm :active_record
+
+  # Restore to pre-5.1 generator due to breaking change.
+  # See https://gitlab.com/gitlab-org/gitlab/-/issues/244371
+  default_generator_method :hex
+
+  # This block will be called to check whether the resource owner is authenticated or not.
+  resource_owner_authenticator do
+    # Put your resource owner authentication logic here.
+    if current_user
+      current_user
+    else
+      # Ensure user is redirected to redirect_uri after login
+      session[:user_return_to] = request.fullpath
+
+      resolver = Gitlab::Auth::OAuth::OauthResourceOwnerRedirectResolver.new(request, session)
+      redirect_to(resolver.resolve_redirect_url)
+      nil
+    end
+  end
+
+  resource_owner_from_credentials do |_routes|
+    user = User.find_by_login(params[:username])
+    next unless user
+
+    next if user.password_automatically_set? && !user.password_based_omniauth_user?
+    next if user.two_factor_enabled? || Gitlab::Auth::TwoFactorAuthVerifier.new(user).two_factor_authentication_enforced?
+
+    Gitlab::Auth.find_with_user_password(params[:username], params[:password], increment_failed_attempts: true)
+  end
+
+  allow_grant_flow_for_client do |grant_flow, client|
+    next true unless client
+    next true unless grant_flow == 'password'
+    next true unless Applications::CreateService.disable_ropc_available?
+
+    client.ropc_enabled?
+  end
+
+  # If you want to restrict access to the web interface for adding oauth authorized applications, you need to declare the block below.
+  # admin_authenticator do
+  #   # Put your admin authentication logic here.
+  #   # Example implementation:
+  #   Admin.find_by_id(session[:admin_id]) || redirect_to(new_admin_session_url)
+  # end
+
+  # Authorization Code expiration time (default 10 minutes).
+  # authorization_code_expires_in 10.minutes
+
+  # Reuse access token for the same resource owner within an application (disabled by default)
+  # Rationale: https://github.com/doorkeeper-gem/doorkeeper/issues/383
+  # reuse_access_token
+
+  # Issue access tokens with refresh token (disabled by default)
+  use_refresh_token
+
+  # Forbids creating/updating applications with arbitrary scopes that are
+  # not in configuration, i.e. `default_scopes` or `optional_scopes`.
+  # (disabled by default)
+  enforce_configured_scopes
+
+  # Forces the usage of the HTTPS protocol in non-native redirect uris (enabled
+  # by default in non-development environments). OAuth2 delegates security in
+  # communication to the HTTPS protocol so it is wise to keep this enabled.
+  #
+  force_ssl_in_redirect_uri false
+
+  # Specify what redirect URI's you want to block during Application creation.
+  # Any redirect URI is whitelisted by default.
+  #
+  # You can use this option in order to forbid URI's with 'javascript' scheme
+  # for example.
+  forbid_redirect_uri { |uri| %w[data vbscript javascript].include?(uri.scheme.to_s.downcase) }
+
+  # Provide support for an owner to be assigned to each registered application (disabled by default)
+  # Optional parameter confirmation: true (default false) if you want to enforce ownership of
+  # a registered application
+  # Note: you must also run the rails g doorkeeper:application_owner generator to provide the necessary support
+  enable_application_owner confirmation: false
+
+  # Define access token scopes for your provider
+  # For more information go to
+  # https://github.com/doorkeeper-gem/doorkeeper/wiki/Using-Scopes
+  default_scopes(*Gitlab::Auth::DEFAULT_SCOPES)
+  optional_scopes(*Gitlab::Auth.optional_scopes)
+
+  # Change the way client credentials are retrieved from the request object.
+  # By default it retrieves first from the `HTTP_AUTHORIZATION` header, then
+  # falls back to the `:client_id` and `:client_secret` params from the `params` object.
+  # Check out the wiki for more information on customization
+  # client_credentials :from_basic, :from_params
+
+  # Change the way access token is authenticated from the request object.
+  # By default it retrieves first from the `HTTP_AUTHORIZATION` header, then
+  # falls back to the `:access_token` or `:bearer_token` params from the `params` object.
+  # Check out the wiki for more information on customization
+  access_token_methods :from_access_token_param, :from_bearer_authorization, :from_bearer_param
+
+  hash_token_secrets using: '::Gitlab::DoorkeeperSecretStoring::Token::Pbkdf2Sha512', fallback: :plain
+
+  hash_application_secrets using: '::Gitlab::DoorkeeperSecretStoring::Secret::Pbkdf2Sha512', fallback: :plain
+
+  # Specify what grant flows are enabled in array of Strings. The valid
+  # strings and the flows they enable are:
+  #
+  # "authorization_code" => Authorization Code Grant Flow
+  # "password"           => Resource Owner Password Credentials Grant Flow
+  # "client_credentials" => Client Credentials Grant Flow
+  #
+  grant_flows %w[authorization_code password client_credentials device_code]
+
+  # Under some circumstances you might want to have applications auto-approved,
+  # so that the user skips the authorization step.
+  # For example if dealing with trusted a application.
+  skip_authorization do |resource_owner, client|
+    client.application.trusted?
+  end
+
+  # WWW-Authenticate Realm (default "Doorkeeper").
+  # realm "Doorkeeper"
+
+  base_controller '::Gitlab::BaseDoorkeeperController'
+
+  # Allow Resource Owner Password Credentials Grant without client credentials,
+  # this was disabled by default in Doorkeeper 5.5.
+  #
+  skip_client_authentication_for_password_grant -> { Gitlab::CurrentSettings.ropc_without_client_credentials }
+
+  # 2 hours in seconds
+  # This is also the database default value
+  #
+  # WARNING: If this is less than `300` some unexpected behavior may occur.
+  # For example, the Web IDE has a baked in expiration buffer of 5 minutes, so
+  # the Web IDE would treat all tokens as expired if this value is `300` or less.
+  access_token_expires_in 7200
+
+  # Use a custom class for generating the application secret.
+  # https://doorkeeper.gitbook.io/guides/configuration/other-configurations#custom-application-secret-generator
+  application_secret_generator 'Gitlab::DoorkeeperSecretStoring::Token::UniqueApplicationToken'
+
+  custom_access_token_attributes [:organization_id]
+
+  enable_dynamic_scopes
+  # Following doorkeeper monkey patches are to identify the organization on best effort basis
+
+  Doorkeeper::OAuth::PasswordAccessTokenRequest.class_eval do
+    private
+
+    def before_successful_response
+      organization = Gitlab::Current::Organization.new(user: resource_owner).organization
+
+      find_or_create_access_token(client, resource_owner, scopes, { organization_id: organization.id }, server)
+      super
+    end
+
+    def validate_client
+      if Doorkeeper.config.skip_client_authentication_for_password_grant.call
+        client.present? || (!parameters[:client_id] && credentials.blank?)
+      else
+        client.present?
+      end
+    end
+  end
+
+  Doorkeeper::DeviceAuthorizationGrant::OAuth::DeviceAuthorizationRequest.class_eval do
+    # @return [Hash]
+    def device_grant_attributes
+      {
+        application_id: client.id,
+        expires_in: configuration.device_code_expires_in,
+        scopes: scopes.to_s,
+        user_code: generate_user_code,
+        # This will result in a fallback to Default Organizzation
+        # OAuth device grant flow doesn't support other organizations yet
+        organization_id: Gitlab::Current::Organization.new.organization.id
+      }
+    end
+  end
+
+  Doorkeeper::DeviceAuthorizationGrant::OAuth::DeviceCodeRequest.class_eval do
+    def generate_access_token
+      find_or_create_access_token(
+        device_grant.application,
+        device_grant.resource_owner_id,
+        device_grant.scopes,
+        { organization_id: device_grant.organization_id },
+        server
+      )
+    end
+  end
+
+  Doorkeeper::OpenidConnect::OAuth::Authorization::Code.class_eval do
+    private
+
+    def create_openid_request(access_grant)
+      ::Doorkeeper::OpenidConnect::Request.create!(
+        access_grant: access_grant,
+        nonce: pre_auth.nonce,
+        organization_id: access_grant.organization_id
+      )
+    end
+  end
+end
+
+
+===== FILE: /gitlab/app/controllers/oauth/tokens_controller.rb =====
+# frozen_string_literal: true
+
+class Oauth::TokensController < Doorkeeper::TokensController
+  include EnforcesTwoFactorAuthentication
+  include RequestPayloadLogger
+  include Gitlab::InternalEventsTracking
+
+  alias_method :auth_user, :current_user
+
+  before_action :validate_pkce_for_dynamic_applications, only: [:create]
+
+  def create
+    if authorize_response.status == :ok
+      track_internal_event(
+        'oauth_authorize_with_gitlab',
+        user: authorize_response.token.resource_owner,
+        additional_properties: {
+          label: server.client.present?.to_s,
+          property: params[:grant_type] # rubocop:disable Rails/StrongParams -- This pattern is followed in the gem
+        }
+      )
+    end
+
+    super
+  end
+
+  private
+
+  def validate_pkce_for_dynamic_applications
+    return unless server.client&.application&.dynamic?
+    return unless params[:code_verifier].blank? # rubocop:disable Rails/StrongParams -- Only accessing a single named param
+
+    render json: {
+      error: 'invalid_request',
+      error_description: 'PKCE code_verifier is required for dynamic OAuth applications'
+    }, status: :bad_request
+  end
+
+  def validate_presence_of_client
+    return if Doorkeeper.config.skip_client_authentication_for_password_grant.call
+
+    # @see 2.1.  Revocation Request
+    #
+    #  The client constructs the request by including the following
+    #  parameters using the "application/x-www-form-urlencoded" format in
+    #  the HTTP request entity-body:
+    #     token   REQUIRED.
+    #     token_type_hint  OPTIONAL.
+    #
+    #  The client also includes its authentication credentials as described
+    #  in Section 2.3. of [RFC6749].
+    #
+    #  The authorization server first validates the client credentials (in
+    #  case of a confidential client) and then verifies whether the token
+    #  was issued to the client making the revocation request.
+    return if server.client
+
+    # If this validation [client credentials / token ownership] fails, the request is
+    # refused and the  client is informed of the error by the authorization server as
+    # described below.
+    #
+    # @see 2.2.1.  Error Response
+    #
+    # The error presentation conforms to the definition in Section 5.2 of [RFC6749].
+    render json: revocation_error_response, status: :forbidden
+  end
+end
+
+
+===== FILE: /gitlab/lib/gitlab/devise_failure.rb =====
+# frozen_string_literal: true
+
+module Gitlab
+  class DeviseFailure < Devise::FailureApp
+    # If the request format is not known, send a redirect instead of a 401
+    # response, since this is the outcome we're most likely to want
+    def http_auth?
+      request_format && super
+    end
+
+    def respond
+      if warden_options[:reason] == :too_many_requests
+        self.status = 403
+      else
+        super
+      end
+    end
+  end
+end
+
+Gitlab::DeviseFailure.prepend_mod
+
+
+===== FILE: /gitlab/lib/gitlab/auth/devise/strategies/combined_two_factor_authenticatable.rb =====
+# frozen_string_literal: true
+
+module Gitlab
+  module Auth
+    module Devise
+      module Strategies
+        # This strategy combines the following strategies from
+        # devise_two_factor gem:
+        # - TwoFactorAuthenticatable: https://github.com/devise-two-factor/devise-two-factor/blob/v4.0.2/lib/devise_two_factor/strategies/two_factor_authenticatable.rb
+        # - TwoFactorBackupable: https://github.com/devise-two-factor/devise-two-factor/blob/v4.0.2/lib/devise_two_factor/strategies/two_factor_backupable.rb
+        # to avoid double incrementing failed login attempts counter by each
+        # strategy in case an incorrect password is provided.
+        class CombinedTwoFactorAuthenticatable < ::Devise::Strategies::DatabaseAuthenticatable
+          def authenticate!
+            resource = mapping.to.find_for_database_authentication(authentication_hash)
+
+            # We check the OTP / backup code, then defer to DatabaseAuthenticatable
+            is_valid = validate(resource) do
+              validate_otp(resource) || resource.invalidate_otp_backup_code!(params[scope]['otp_attempt'])
+            end
+
+            if is_valid
+              # Devise fails to authenticate invalidated resources, but if we've
+              # gotten here, the object changed (Since we deleted a recovery code)
+              resource.save!
+
+              super
+            end
+
+            fail(::Devise.paranoid ? :invalid : :not_found_in_database) unless resource # rubocop: disable Style/SignalException
+
+            # We want to cascade to the next strategy if this one fails,
+            # but database authenticatable automatically halts on a bad password
+            @halted = false if @result == :failure
+          end
+
+          def validate_otp(resource)
+            return true unless resource.otp_required_for_login
+
+            return if params[scope]['otp_attempt'].nil?
+
+            resource.validate_and_consume_otp!(params[scope]['otp_attempt'])
+          end
+        end
+      end
+    end
+  end
+end
+
+Warden::Strategies.add(
+  :combined_two_factor_authenticatable,
+  Gitlab::Auth::Devise::Strategies::CombinedTwoFactorAuthenticatable)
+
+
+===== FILE: /gitlab/lib/api/helpers/personal_access_tokens_helpers.rb =====
+# frozen_string_literal: true
+
+module API
+  module Helpers
+    module PersonalAccessTokensHelpers
+      extend Grape::API::Helpers
+
+      params :access_token_params do
+        optional :revoked, type: Boolean, desc: 'Filter tokens where revoked state matches parameter',
+          documentation: { example: false }
+        optional :state, type: String, desc: 'Filter tokens which are either active or not',
+          values: %w[active inactive], documentation: { example: 'active' }
+        optional :created_before, type: DateTime, desc: 'Filter tokens which were created before given datetime',
+          documentation: { example: '2022-01-01' }
+        optional :created_after, type: DateTime, desc: 'Filter tokens which were created after given datetime',
+          documentation: { example: '2021-01-01' }
+        optional :last_used_before, type: DateTime, desc: 'Filter tokens which were used before given datetime',
+          documentation: { example: '2021-01-01' }
+        optional :last_used_after, type: DateTime, desc: 'Filter tokens which were used after given datetime',
+          documentation: { example: '2022-01-01' }
+        optional :expires_before, type: Date, desc: 'Filter tokens which expire before given datetime',
+          documentation: { example: '2022-01-01' }
+        optional :expires_after, type: Date, desc: 'Filter tokens which expire after given datetime',
+          documentation: { example: '2021-01-01' }
+        optional :search, type: String, desc: 'Filters tokens by name', documentation: { example: 'token' }
+        optional :sort, type: String, desc: 'Sort tokens', documentation: { example: 'created_at_desc' }
+      end
+
+      params :create_personal_access_token_params do
+        requires :name, type: String, desc: 'The name of the access token', documentation: { example: 'My token' }
+        optional :description, type: String, desc: 'The description of the access token',
+          documentation: { example: 'A token used for k8s' }
+        optional :expires_at, type: Date, desc: "Expiration date of the access token in ISO format (YYYY-MM-DD). " \
+                                            "If undefined, the date is set to the maximum allowable lifetime limit.",
+          documentation: { example: '2021-01-31' }
+      end
+
+      def finder_params(current_user)
+        user_param =
+          if current_user.can_admin_all_resources?
+            if params[:user_id].present?
+              user = user(params[:user_id])
+
+              not_found! if user.nil?
+
+              { user: user }
+            else
+              not_found! if params.key?(:user_id)
+
+              {}
+            end
+          else
+            { user: current_user, impersonation: false }
+          end
+
+        declared(params, include_missing: false).merge(user_param)
+      end
+
+      def user(user_id)
+        UserFinder.new(user_id).find_by_id
+      end
+
+      def restrict_non_admins!
+        return if params[:user_id].blank?
+
+        unauthorized! unless Ability.allowed?(current_user, :read_user_personal_access_tokens, user(params[:user_id]))
+      end
+
+      def find_token(id)
+        PersonalAccessToken.find(id) || not_found!
+      end
+
+      def revoke_token(token, group: nil)
+        service = ::PersonalAccessTokens::RevokeService.new(current_user, token: token, group: group).execute
+
+        service.success? ? no_content! : bad_request!(service.message)
+      end
+
+      def rotate_token(token, params)
+        service = ::PersonalAccessTokens::RotateService.new(current_user, token, nil, params).execute
+
+        if service.success?
+          status :ok
+
+          service.payload[:personal_access_token]
+        else
+          bad_request!(service.message)
+        end
+      end
+
+      def rotate_token_for_resource(token, resource, params)
+        response = if resource.is_a?(Project)
+                     ::ProjectAccessTokens::RotateService.new(
+                       current_user, token, resource, params).execute
+                   elsif resource.is_a?(Group)
+                     ::GroupAccessTokens::RotateService.new(
+                       current_user, token, resource, params).execute
+                   end
+
+        if response.success?
+          status :ok
+
+          response.payload[:personal_access_token]
+        else
+          bad_request!(response.message)
+        end
+      end
+    end
+  end
+end
+
+
