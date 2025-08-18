@@ -1,0 +1,372 @@
+===== FILE: /workspace/build_auth_subset.py =====
+import os
+import re
+import sys
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Set, Tuple
+
+LIMIT_TOKENS: int = 200_000
+ROOT_DIR: Path = Path("/workspace").resolve()
+OUTPUT_FILE: Path = ROOT_DIR / "auth_subset.txt"
+
+# Directories that are unlikely to be relevant or are too large/noisy
+EXCLUDED_DIR_NAMES: Set[str] = {
+	".git",
+	".hg",
+	".svn",
+	"node_modules",
+	"dist",
+	"build",
+	"coverage",
+	".next",
+	".turbo",
+	"vendor",
+	"venv",
+	".venv",
+	"target",
+	"__pycache__",
+	".cache",
+	".idea",
+	".vscode",
+	".pnpm-store",
+	".yarn",
+	"tmp",
+	"logs",
+}
+
+# Reasonable upper bound to avoid huge artifacts/bundles
+MAX_FILE_SIZE_BYTES: int = 1_000_000
+
+# File types to consider
+INCLUDED_EXTENSIONS: Set[str] = {
+	".js",
+	".jsx",
+	".ts",
+	".tsx",
+	".mjs",
+	".cjs",
+	".py",
+	".go",
+	".java",
+	".kt",
+	".cs",
+	".php",
+	".rb",
+	".rs",
+	".scala",
+	".swift",
+	".c",
+	".cc",
+	".cpp",
+	".h",
+	".hpp",
+	".json",
+	".yaml",
+	".yml",
+	".toml",
+	".ini",
+	".env",
+	".sh",
+}
+
+HEADER_PATTERN = "===== FILE: {path} =====\n"
+
+# Authentication/security related keywords
+KEYWORDS_RE = re.compile(
+	# fmt: off
+	r"\b("
+	"auth|authenticate|authorization|authorisation|authorise|authorizer|authorizer|"
+	"jwt|jws|jwe|token|refresh[_-]?token|access[_-]?token|id[_-]?token|csrf|x-csrf-token|"
+	"session|cookie|secure|httponly|samesite|"
+	"login|signin|logout|signup|register|password|passphrase|bcrypt|argon2|scrypt|hash|pepper|salt|"
+	"passport|oauth|oauth2|oidc|open[id]?[c]?|saml|sso|two[-_ ]?factor|mfa|totp|hotp|webauthn|fido2|"
+	"api[_-]?key|x-api-key|hmac|macaroon"
+	")\b",
+	re.IGNORECASE,
+	# fmt: on
+)
+
+RELATIVE_IMPORT_PREFIXES = ("./", "../", ".")
+
+
+def is_text_file(path: Path) -> bool:
+	try:
+		with open(path, "rb") as f:
+			chunk = f.read(8000)
+		# Heuristic: if NUL byte exists, it's likely binary
+		return b"\x00" not in chunk
+	except Exception:
+		return False
+
+
+def iter_candidate_files(root: Path) -> Iterable[Path]:
+	for dirpath, dirnames, filenames in os.walk(root):
+		# Prune excluded directories in-place to avoid walking them
+		dirnames[:] = [d for d in dirnames if d not in EXCLUDED_DIR_NAMES]
+		for filename in filenames:
+			path = Path(dirpath) / filename
+			# Always skip gigantic files
+			try:
+				if path.stat().st_size > MAX_FILE_SIZE_BYTES:
+					continue
+			except Exception:
+				continue
+
+			# Consider Dockerfile/Makefile regardless of extension
+			if filename in {"Dockerfile", "Makefile"}:
+				yield path
+				continue
+
+			ext = path.suffix.lower()
+			if ext in INCLUDED_EXTENSIONS:
+				yield path
+
+
+def file_matches_auth(path: Path, text: str) -> bool:
+	if KEYWORDS_RE.search(text):
+		return True
+	# Also include files with auth-ish names even if content didn't match (e.g., empty stubs)
+	name = path.name.lower()
+	if any(k in name for k in [
+		"auth",
+		"login",
+		"jwt",
+		"token",
+		"session",
+		"password",
+		"oauth",
+		"oidc",
+		"passport",
+		"user",
+		"middleware",
+		"guard",
+		"security",
+	]):
+		return True
+	return False
+
+
+def safe_read_text(path: Path) -> Optional[str]:
+	try:
+		if not is_text_file(path):
+			return None
+		return path.read_text(encoding="utf-8", errors="ignore")
+	except Exception:
+		return None
+
+
+def resolve_js_like_import(base_file: Path, spec: str) -> Optional[Path]:
+	if not spec.startswith(("./", "../")):
+		return None
+	base_dir = base_file.parent
+	base = (base_dir / spec).resolve()
+	# Candidate resolution order
+	candidates: List[Path] = []
+	if base.suffix:
+		candidates.append(base)
+	else:
+		for ext in [
+			".ts",
+			".tsx",
+			".js",
+			".jsx",
+			".mjs",
+			".cjs",
+			".json",
+		]:
+			candidates.append(base.with_suffix(ext))
+			candidates.append((base / "index").with_suffix(ext))
+	for c in candidates:
+		if c.exists() and c.is_file():
+			return c
+	return None
+
+
+def resolve_python_import(base_file: Path, spec: str) -> Optional[Path]:
+	# Handle relative imports like from .module import X or from ..pkg import Y
+	relative_match = re.match(r"^(\.+)(.*)$", spec)
+	if not relative_match:
+		return None
+	level = len(relative_match.group(1))
+	module_part = relative_match.group(2).lstrip(".")
+	base_dir = base_file.parent
+	for _ in range(level - 1):
+		base_dir = base_dir.parent
+	module_path = base_dir / module_part.replace(".", "/")
+	candidates = [
+		module_path.with_suffix(".py"),
+		module_path / "__init__.py",
+	]
+	for c in candidates:
+		if c.exists() and c.is_file():
+			return c
+	return None
+
+
+def parse_local_imports(path: Path, text: str) -> List[Path]:
+	resolved: List[Path] = []
+	# JS/TS style imports
+	for m in re.finditer(r"(?:import\s+[^'\"]*?\s+from\s+['\"]([^'\"]+)['\"]|require\(\s*['\"]([^'\"]+)['\"]\s*\))", text):
+		spec = m.group(1) or m.group(2)
+		cand = resolve_js_like_import(path, spec)
+		if cand is not None:
+			resolved.append(cand)
+	# Python imports
+	for m in re.finditer(r"^\s*from\s+([^\s]+)\s+import|^\s*import\s+([^\s]+)", text, flags=re.MULTILINE):
+		spec = m.group(1) or m.group(2)
+		cand = resolve_python_import(path, spec)
+		if cand is not None:
+			resolved.append(cand)
+	return resolved
+
+
+def prioritize(path: Path) -> int:
+	p = str(path).lower()
+	score = 0
+	# Strong signals for auth-related artifacts
+	for kw, weight in [
+		("auth", 120),
+		("jwt", 100),
+		("token", 95),
+		("login", 90),
+		("session", 85),
+		("password", 85),
+		("oauth", 80),
+		("oidc", 80),
+		("passport", 70),
+		("user", 60),
+		("middleware", 60),
+		("guard", 55),
+	]:
+		if kw in p:
+			score += weight
+	# De-prioritize tests/mocks/examples
+	for kw, weight in [
+		("test", -120),
+		("spec", -120),
+		("mock", -100),
+		("fixture", -80),
+		("example", -60),
+		("story", -60),
+		("snapshot", -60),
+		("e2e", -60),
+		("__mocks__", -100),
+	]:
+		if kw in p:
+			score += weight
+	return score
+
+
+def collect_auth_related_files(root: Path, max_files: int = 4000) -> List[Path]:
+	candidates: List[Path] = []
+	for path in iter_candidate_files(root):
+		text = safe_read_text(path)
+		if text is None:
+			continue
+		if file_matches_auth(path, text):
+			candidates.append(path)
+	# Seed set sorted by priority
+	candidates = sorted(set(candidates), key=prioritize, reverse=True)
+	# Expand with local imports to keep subset self-contained
+	result: List[Path] = []
+	seen: Set[Path] = set()
+	queue: List[Path] = candidates[:]
+	while queue and len(result) < max_files:
+		path = queue.pop(0)
+		if path in seen:
+			continue
+		seen.add(path)
+		text = safe_read_text(path)
+		if text is None:
+			continue
+		result.append(path)
+		for dep in parse_local_imports(path, text):
+			if dep not in seen and dep.exists() and dep.is_file():
+				queue.append(dep)
+	return result
+
+
+def compute_tokens_for_text(enc, text: str) -> int:
+	try:
+		return len(enc.encode(text))
+	except Exception:
+		# Extremely rare; fall back to length/3 heuristic
+		return max(1, len(text) // 3)
+
+
+def build_output(files: List[Path]) -> Tuple[str, Dict[Path, int]]:
+	try:
+		import tiktoken  # type: ignore
+		enc = tiktoken.get_encoding("cl100k_base")
+	except Exception:
+		# Lazy import failure handling
+		enc = None
+
+	parts: List[str] = []
+	per_file_tokens: Dict[Path, int] = {}
+	for path in files:
+		text = safe_read_text(path) or ""
+		header = HEADER_PATTERN.format(path=str(path))
+		content = header + text + ("\n" if not text.endswith("\n") else "")
+		if enc is not None:
+			per_file_tokens[path] = compute_tokens_for_text(enc, content)
+		else:
+			per_file_tokens[path] = max(1, len(content) // 3)
+		parts.append(content)
+	return "".join(parts), per_file_tokens
+
+
+def prune_to_token_limit(files: List[Path], per_file_tokens: Dict[Path, int], limit: int) -> List[Path]:
+	ordered = sorted(files, key=lambda p: (prioritize(p), -per_file_tokens.get(p, 0)), reverse=True)
+	total = sum(per_file_tokens.get(p, 0) for p in ordered)
+	if total <= limit:
+		return ordered
+	# Drop lowest priority files until under the limit
+	kept: List[Path] = []
+	acc = 0
+	for p in ordered:
+		if acc + per_file_tokens.get(p, 0) <= limit:
+			kept.append(p)
+			acc += per_file_tokens.get(p, 0)
+	# If even top file exceeds limit (unlikely), keep it and truncate later
+	if not kept and ordered:
+		kept = [ordered[0]]
+	return kept
+
+
+def write_output(files: List[Path]) -> Tuple[int, int]:
+	content, per_file_tokens = build_output(files)
+	try:
+		import tiktoken  # type: ignore
+		enc = tiktoken.get_encoding("cl100k_base")
+		total_tokens = compute_tokens_for_text(enc, content)
+	except Exception:
+		total_tokens = max(1, len(content) // 3)
+
+	if total_tokens > LIMIT_TOKENS:
+		# Prune and rebuild once to respect the limit
+		files_pruned = prune_to_token_limit(files, per_file_tokens, LIMIT_TOKENS)
+		content, per_file_tokens = build_output(files_pruned)
+		try:
+			import tiktoken  # type: ignore
+			enc = tiktoken.get_encoding("cl100k_base")
+			total_tokens = compute_tokens_for_text(enc, content)
+		except Exception:
+			total_tokens = max(1, len(content) // 3)
+		files = files_pruned
+
+	OUTPUT_FILE.write_text(content, encoding="utf-8")
+	return len(files), total_tokens
+
+
+def main() -> None:
+	files = collect_auth_related_files(ROOT_DIR)
+	count, tokens = write_output(files)
+	print(f"WROTE: {OUTPUT_FILE}")
+	print(f"FILES: {count}")
+	print(f"TOKENS: {tokens}")
+
+
+if __name__ == "__main__":
+	main()
+
