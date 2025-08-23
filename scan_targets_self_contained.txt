@@ -1,0 +1,130 @@
+# SET 1: Uploads and attachments authorization
+app/controllers/uploads_controller.rb
+app/controllers/banzai/uploads_controller.rb
+app/controllers/concerns/uploads_actions.rb
+app/uploaders/personal_file_uploader.rb
+app/uploaders/namespace_file_uploader.rb
+app/uploaders/attachment_uploader.rb
+app/uploaders/avatar_uploader.rb
+config/routes/uploads.rb
+
+# SET 2: Sessions and active sessions
+app/models/active_session.rb
+app/controllers/user_settings/active_sessions_controller.rb
+config/initializers/session_store.rb
+lib/gitlab/redis/sessions.rb
+lib/gitlab/sessions/cache_store.rb
+
+# SET 3: Membership and access control
+app/controllers/concerns/membership_actions.rb
+app/controllers/projects/project_members_controller.rb
+app/controllers/groups/group_members_controller.rb
+app/controllers/projects/group_links_controller.rb
+app/controllers/groups/group_links_controller.rb
+app/controllers/projects/deploy_keys_controller.rb
+app/services/projects/enable_deploy_key_service.rb
+
+# SET 4: OAuth/OmniAuth flows
+config/initializers/doorkeeper.rb
+app/controllers/oauth/authorizations_controller.rb
+app/controllers/oauth/tokens_controller.rb
+app/controllers/oauth/applications_controller.rb
+app/controllers/oauth/authorized_applications_controller.rb
+app/controllers/omniauth_callbacks_controller.rb
+app/controllers/jwt_controller.rb
+lib/gitlab/api_authentication/token_locator.rb
+
+# SET 5: Notifications unsubscribe and email-based actions
+app/controllers/sent_notifications_controller.rb
+app/models/sent_notification.rb
+app/controllers/users/unsubscribes_controller.rb
+config/routes.rb
+
+# SET 6: Projects - pipelines, jobs, artifacts, environments (auth-sensitive)
+app/controllers/projects/pipelines_controller.rb
+app/controllers/projects/pipelines/application_controller.rb
+app/controllers/projects/jobs_controller.rb
+app/controllers/projects/build_artifacts_controller.rb
+app/controllers/projects/artifacts_controller.rb
+app/controllers/projects/environments_controller.rb
+app/controllers/projects/deployments_controller.rb
+app/controllers/projects/refs_controller.rb
+app/controllers/projects/redirect_controller.rb
+app/controllers/projects/hooks_controller.rb
+app/controllers/projects/hook_logs_controller.rb
+
+# SET 7: Groups/project dependency proxies & uploads
+app/controllers/groups/dependency_proxy_for_containers_controller.rb
+app/controllers/groups/uploads_controller.rb
+
+# SET 8: Admin - user and tokens management
+app/controllers/admin/users_controller.rb
+app/controllers/admin/impersonation_tokens_controller.rb
+app/controllers/admin/keys_controller.rb
+app/controllers/admin/hooks_controller.rb
+app/controllers/admin/broadcast_messages_controller.rb
+app/controllers/admin/sessions_controller.rb
+
+# SET 9: Import/Export and Bulk Imports (direct transfer)
+app/controllers/import/bulk_imports_controller.rb
+lib/api/bulk_imports.rb
+app/services/bulk_imports/file_download_service.rb
+lib/import/clients/http.rb
+config/routes/import.rb
+
+# SET 10: API endpoints for sensitive objects
+lib/api/users.rb
+lib/api/projects.rb
+lib/api/groups.rb
+lib/api/repositories.rb
+lib/api/project_hooks.rb
+lib/api/project_job_token_scope.rb
+lib/api/protected_branches.rb
+lib/api/protected_tags.rb
+lib/api/markdown_uploads.rb
+lib/api/notes.rb
+lib/api/project_container_repositories.rb
+lib/api/project_container_registry_protection_rules.rb
+lib/api/resource_access_tokens/resource_access_tokens.rb
+lib/api/remote_mirrors.rb
+lib/api/keys.rb
+lib/api/issues.rb
+lib/api/release/releases.rb
+lib/api/environments.rb
+lib/api/freeze_periods.rb
+
+# SET 11: Headers/security sensitive controllers
+app/controllers/graphql_controller.rb
+app/controllers/root_controller.rb
+app/controllers/well_known_controller.rb
+app/controllers/concerns/workhorse_request.rb
+app/controllers/concerns/static_object_external_storage.rb
+app/controllers/concerns/notes_actions.rb
+app/controllers/concerns/issuable_actions.rb
+
+# SET 12: Webhooks and Mailgun
+app/controllers/mailgun/webhooks_controller.rb
+app/controllers/web_hooks_controller.rb
+app/controllers/concerns/web_hooks/hook_log_actions.rb
+
+# SET 13: Wiki and raw content
+app/controllers/concerns/wiki_actions.rb
+app/controllers/help_controller.rb
+
+# SET 14: Terraform/DependencyProxy/Package services (archive handling)
+app/services/packages/nuget/process_package_file_service.rb
+app/services/packages/nuget/symbols/create_symbol_files_service.rb
+app/services/packages/npm/process_package_file_service.rb
+app/services/packages/terraform_module/process_package_file_service.rb
+app/services/packages/terraform_module/metadata/extract_files_service.rb
+app/services/packages/helm/extract_file_metadata_service.rb
+
+# SET 15: Runner and job token flows
+app/controllers/projects/runners_controller.rb
+app/controllers/projects/runner_projects_controller.rb
+lib/api/user_runners.rb
+lib/api/project_job_token_scope.rb
+
+# SET 16: Uploads storage backend
+app/models/upload.rb
+app/models/uploads/local.rb
