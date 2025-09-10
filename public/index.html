@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>MiniTik</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">MiniTik</div>
+      <div class="actions">
+        <button id="toggleUpload" class="button">Upload</button>
+      </div>
+    </header>
+
+    <section id="uploader" class="uploader hidden">
+      <form id="uploadForm">
+        <label class="field">
+          <span>Choose video</span>
+          <input id="videoFile" name="video" type="file" accept="video/*" required />
+        </label>
+        <label class="field">
+          <span>Caption (optional)</span>
+          <input id="caption" name="caption" type="text" maxlength="200" placeholder="Say something..." />
+        </label>
+        <div class="form-actions">
+          <button type="submit" class="button primary">Upload</button>
+          <button type="button" id="cancelUpload" class="button">Cancel</button>
+        </div>
+        <div id="uploadStatus" class="status"></div>
+      </form>
+    </section>
+
+    <main id="feed" class="feed"></main>
+
+    <template id="videoTemplate">
+      <section class="video-card">
+        <video class="video" playsinline muted loop preload="metadata"></video>
+        <div class="overlay bottom">
+          <div class="caption"></div>
+        </div>
+        <div class="overlay right controls">
+          <button class="like">❤️ <span class="like-count">0</span></button>
+          <div class="views">👁️ <span class="view-count">0</span></div>
+        </div>
+        <div class="overlay top hint">Tap video to toggle sound</div>
+      </section>
+    </template>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+  </html>
+
